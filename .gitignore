@@ -47,3 +47,27 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# large datasets
+data/PyPSA-kits/
+data/*/gadm/
+data/*/gwa/
+data/*/nrel/
+data/*/mod_adm/
+*/*/*IND*
+*/*/*CHN*
+*/*/*CHL*
+*/*/*COL*
+*/*/*MYS*
+*/*/*THA*
+*/*/*VNM*
+*/*/*KAZ*
+*/IND/*
+*/CHN/*
+*/CHL/*
+*/COL/*
+*/MYS/*
+*/THA/*
+*/VNM/*
+*/KAZ/*
+config/mod_adm

@@ -1,0 +1,2528 @@
+---
+title: "Import PyPSA-Earth model dataset"
+subtitle: "build Switch and energyRt models, update PyPSA-Earth input"
+author: "Multi-Country Electricity Transition Potential and Challenges"
+date:  "`r Sys.Date()`"
+format: 
+  html:
+    code-fold: true
+    fig-width: 8
+    fig-height: 6
+    toc: true
+  pdf:
+    fig-width: 7
+    fig-height: 5  
+    toc: true
+execute:
+  echo: true # should the code be echoed in the output document?
+  eval: true # should the code be evaluated? (doesn't override chunk settings)
+  error: false # Include errors in the output (false == stop on error)
+  # warning: false # Include warnings in the output
+  # message: false # Include messages in the output
+  
+# Model parameters
+params: 
+  iso3c: BGD # country code
+  
+  # Model choice, defined by selection of a the YAML file
+  yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
+  # yaml_path: "config/mod_adm" # file: "{yaml_path}/config_{iso3c}.yml
+  # yaml_path: "config/mod_custom" # file: "{yaml_path}/config_{iso3c}.yml
+
+  # Execution controls
+  save_raw_csv: false # save imported PyPSA-Earth data as csv files
+  build_switch: true # write/overwrite Switch model input files
+  solve_switch: false # solve Switch model
+  build_energyRt: false # write/overwrite energyRt model input files
+  solve_energyRt: false # solve energyRt model
+
+  force: true # try to auto-resolve some declaration errors in data?
+  
+  # Adjustments to the imported PyPSA-Earth data
+  ## 1. Use tech-data from PyPSA-techs dataset (costs, fuels, lifetime)
+  use_tech_database: false # 
+  ## 2. Capacity factors from MERRA2 (wind and solar only)
+  use_merra_data: true # Update capacity factors with (pre-saved) MERRA-2
+  weather_year: 2013 # weather year
+  sol_cl_tol: 1 # SD loss tolerance [0-1] (1 == 100%, one cluster per region)
+  win_cl_tol: 1 # SD loss tolerance [0-1] (1 == 100%, one cluster per region)
+  sol_cl_max: 100 # import first X clusters per region
+  win_cl_max: 100 # import first X clusters per region
+  sol_landuse_up: .1 # max share of used land per cluster for solar PVs [0-1]
+  win_landuse_up: .5 # max share of used land per cluster for onshore wind [0-1]
+  wif_landuse_up: .0 # max share of used area per cluster for offshore wind 
+  # add_offshore_wind: false # add offshore wind - not implemented yet
+  
+  ## 3. Update PyPSA-Earth dataset with MERRA2 data
+  update_pypsa_model: false # only for CL1_TOL1 - one cluster per region
+  new_pypsa_file_ending: "_merra.nc" # adds to the modified nc-file
+  
+  # YAML file parameters can be overwritten here
+  # fig_map_width: 6
+  # ...
+---
+
+# `r countrycode::countrycode(params$iso3c, "iso3c", "country.name")` model
+
+::: {.center data-latex=""}
+**\[WORK IN PROGRESS\]**
+:::
+
+  \newline This documented is a reproducible example of "translation" of PyPSA-Earth electric power sector models to Switch and energyRt models. The three models have differences in representation of generating technologies, energy storage, and other model elements. Notes along the script with an interim output describe all steps of the process of the "translation", e.g. remapping the data and parameters from PyPSA to Switch and energyRt, and describes the structure of the model and the data. This experimental exercise has a goal to compare and analyze structural differences between the three models.\
+\newline The script in this document reads Yaml configuration file for a country which sets input directories (with PyPSA-Earth files) and destination directories for raw `csv` files of the data-sets, Switch and/or energyRt models. There are two ways to run script in the vignette for a country for which PyPSA-Earth dataset is available. First, it can be downloaded to your project's home directory and "knitted" in RStudio (see "Knit" menu for ".rmd" files). In this case edit the vignette's YAML-header if necessary (top of the file). Alternatively, the whole script can be executed from a R-console (see [Get started](https://opendecarbonization.github.io/revaluation/articles/revaluation.html).)
+
+\newpage
+
+## Setup
+
+Load required libraries, set country by `iso3c` code for the evaluation, read yaml file, and load maps.
+
+```{r setup}
+#| warning: false
+#| message: false
+#| collapse: true
+#| echo: !expr params$echo
+
+source("functions.R")
+stopifnot(mcet_check_installations())
+library(tidyverse)
+library(ggrepel)
+library(glue)
+library(sf)
+library(fst)
+library(data.table)
+library(revaluation)
+library(energyRt)
+# library(future)
+
+# Set country
+rev_set_country(params$iso3c)
+rev_country()
+
+# read configuration file for the country
+p <- rev_read_yaml(path = params$yaml_path, iso3c = params$iso3c)
+
+# import/merge YAML parameters
+for (i in 1:length(params)) {p[[names(params)[i]]] <- params[[i]]}
+
+# load maps
+(load(p$files$gis))
+
+if (p$use_tech_database) (load("data/repo_pypsa_techs.RData"))
+
+```
+
+## Import PyPSA-Earth dataset
+
+Read PyPSA's `.nc` file with the model input data, group by sets, and return as a list with tables. Every table is matched with known set of parameters (column names) for further use in the "translation" process to other models.
+
+```{r read_nc}
+#| warning: false
+
+# read data from pypsa network nc-file (see config_{}.yml file)
+nc <- rev_read_pypsa_nc(p$files$pypsa_network)
+class(nc) # tables stored in the named list (use `names(nc)` to print names)
+
+# read PyPSA config file
+pypsa_config <- yaml::read_yaml(p$files$pypsa_yaml)
+
+# import the model year
+p$base_year <- pypsa_config$load_options$prediction_year
+p$weather_year <- pypsa_config$load_options$weather_year
+p$discount <- pypsa_config$costs$discountrate
+
+if (is.null(p$discount)) { 
+  # fix empty values for Switch import
+  p$discount <- 0
+}
+
+if (p$use_merra_data) {
+  win_cl_mask <- rev_merra_cl_filemask(p$win_cl_tol)
+  sol_cl_mask <- rev_merra_cl_filemask(p$sol_cl_tol)
+  if (win_cl_mask == sol_cl_mask) {
+    tol_sfx <- glue("_{win_cl_mask}")
+  } else {
+    tol_sfx <- glue("W{win_cl_mask}_S{sol_cl_mask}")
+  }
+} else {
+  tol_sfx <- ""
+}
+```
+
+## "BASE" scenario settings
+Scenario without any policy intervention. It is used as a base for other scenarios.
+```{r}
+if (is.null(p$scen)) p$scen <- list()
+if (is.null(p$scen$BASE)) p$scen$BASE <- list()
+
+# name of the BASE scenario
+p$scen$BASE$name <- glue("scen_pypsa_", p$base_year, tol_sfx,
+                         ifelse(p$use_tech_database, "_tdb", ""))
+
+# BASE scenario directory
+(p$scen$BASE$root <- file.path(p$dir$scen, p$scen$BASE$name))
+
+# base scenario directory - switch files
+if (p$build_switch) {
+  (p$scen$BASE$switch <- file.path(p$scen$BASE$root, "switch"))
+  if (!dir.exists(p$scen$BASE$switch)) {
+    message("Creating: ")
+    dir.create(p$scen$BASE$switch, recursive = T)
+  }
+  message("Switch scenario directory: ", p$scen$BASE$switch)
+}
+
+# base scenario directory - energyRt files
+if (p$build_energyRt) {
+  (p$scen$BASE$energyRt <- file.path(p$scen$BASE$root, "energyRt"))
+  if (!dir.exists(p$scen$BASE$energyRt)) {
+    message("Creating: ")
+    dir.create(p$scen$BASE$root, recursive = T)
+  }
+  message("energyRt scenario directory: ", p$scen$BASE$energyRt)
+}
+# knitr::opts_chunk$set(eval = F)
+```
+
+### Export to .csv
+
+Optional (see `save_raw_csv` parameter in Yaml header of the vignette) saving of the tables as `.csv` files to the given in yaml file directory.
+
+```{r}
+#| eval: !expr params$save_raw_csv
+
+# set directory for csv files ('csv_dir') and execute the chunk
+if (params$save_raw_csv) {
+  csv_dir <- file.path(p$dir$tmp, "pypsa/raw")
+  dir.create(csv_dir, showWarnings = F, recursive = T)
+  message("Saving raw csv files: ", csv_dir)
+  
+  for (i in 1:length(nc)) {
+    if (is.data.frame(nc[[i]])) {
+      fname <- file.path(csv_dir, paste0(names(nc)[i], ".csv"))
+      cat(fname, "\n")
+      fwrite(nc[[i]], fname, row.names = F)
+    }
+  }
+}
+```
+
+
+## Regions / buses / load zones
+
+The tree models (PyPSA, Switch, energyRt) have similar notion: buses (PyPSA), load zones (Switch), regions (energyRt). They add spatial dimension to the models, separate modeled objects (generators, loads, etc.) in different zones/regions/buses (used as synonyms in the text below), and link those in the same zones. Though objects in one regions can also be separated (different models use different techniques to do that), they are connected by default. Therefore each particular region/zone/bus can be considered as a "copperplate model" by default (unless they are intentionally disconnected). In contrary, objects in different regions are disconnected by default. Models provide ways to connect them by adding links/transmission/trade and other objects.
+
+Higher number of regions in a model gives better representation of the real-world problem, but it goes with higher computational burden. In this example, the initial model has simplified regions based on scaling down the existing (estimated - see \[...\]) power network. For simplicity we assume that the future demand for electricity will grow ...\[!!!*to discuss*!!!\]... This assumption can be changed later.
+
+Key objects (created in the chunk below):\
+`reg_names` - table with names of buses, regions, and load_zones\
+`reg_nodes` - `reg_names` with coordinates of network nodes\
+`adm1_map` - ggplot map with administrative boundaries (for information and potentially alternative set of scenarios)
+
+```{r}
+# names of region (energyRt), buses (PyPSA), and load zones (Switch)
+reg_names <- tibble(
+  bus = nc$loads_set$loads_t_p_set_i, # PyPSA
+  region = rev_bus2reg(nc$loads_set$loads_t_p_set_i, mod = p$model) # energyRt
+) |>
+  mutate(
+    load_zones = region # Switch
+  )
+
+# geographic locations of network nodes, one per region
+reg_nodes <- nc$buses |> filter(buses_i %in% reg_names$bus) |>
+  mutate(
+    bus = buses_i,
+    lon = buses_x,
+    lat = buses_y
+  ) |>
+  left_join(reg_names, by = "bus") |>
+  select(bus, region, load_zones, lon, lat)
+
+reg_nodes_sf <- st_as_sf(reg_nodes, coords = c("lon", "lat")) |>
+  st_set_crs(st_crs(gis$mod_map$sf))
+
+# Map with administrative divisions
+model_map <- ggplot() + 
+  geom_sf(data = gis$mod_map$sf, fill = "wheat") +
+  geom_sf(data = reg_nodes_sf, color = "red") +
+  # geom_point(aes(lon, lat), data = reg_nodes, col = "red") +
+  labs(title = paste0(p$country, " (", nrow(gis$adm1$sf), " administrative regions)"), 
+       x = "", y = "") +
+  rev_theme_map()
+
+```
+
+### Maps for reports
+
+Creating basic maps (as `ggplot` objects) to use in reports.
+
+```{r}
+gis_sf <- gis$mod_map$sf
+```
+
+### switch: load_zones.csv
+
+Writing Switch input file with load_zones.
+
+```{r}
+#| eval: !expr params$build_switch
+
+dir.create(file.path(p$scen$BASE$switch, "inputs"), showWarnings = F, recursive = T)
+load_zones <- tibble(LOAD_ZONE = reg_names$load_zones)
+write.csv(load_zones, 
+          file = file.path(p$scen$BASE$switch, "inputs/load_zones.csv"), 
+          row.names = FALSE, quote = FALSE)
+head(load_zones, 3); cat("nrow = ", nrow(load_zones))
+
+stopifnot(!any(is.na((load_zones))))
+```
+
+## timeslices / snapshots / timepoints
+
+\[!!ToDo::update!!\] Time dimension in energyRt is set by years and hierarchical sub-annual dimensions (slices). In this project we use use three levels of slices: annual ("ANNUAL"), year-day ("YDAY", from 1 to 365), and hour ("HOUR", 0 to 23). The names and elements of all levels are already saved in `revaluation::rev_data$tsl$d365_h24`. The mapping with PyPSA's "snapshots" are stored in `revaluation::rev_data$timedim`.
+
+```{r}
+# timedim <- rev_data$timedim |> mutate(timepoints = slice)
+timedim <- revaluation::rev_data$timescales$full_year
+
+# timetable <- revaluation::rev_data$timescales$full_year |> 
+#   mutate(
+#     d365_h24 = slice,
+#     h8760 = paste0("h", formatC(snapshots + 1, width = 4, flag = "0")),
+#     timepoints = slice
+#   )
+# timetable
+
+```
+
+### switch: periods.csv
+
+This table represent time-horizon in Switch.\
+The current model has only one (base) year for comparative reasons.
+
+```{r periods.csv}
+#| eval: !expr params$build_switch
+
+periods <- tibble(
+  INVESTMENT_PERIOD = p$base_year,
+  period_start = p$base_year,
+  period_end = p$base_year
+)
+# stop()
+stopifnot(!any(is.na(periods)))
+write.csv(periods, file = file.path(p$scen$BASE$switch, "inputs/periods.csv"), 
+            row.names = FALSE, quote = FALSE)
+periods
+```
+
+### switch: timeseries.csv
+
+...
+
+```{r}
+#| eval: !expr params$build_switch
+
+timeseries <- tibble(
+  TIMESERIES = paste0(p$base_year, "_all"),
+  ts_period	= p$base_year,
+  ts_duration_of_tp = 1L,
+  ts_num_tps = 24L * 365L,
+  ts_scale_to_period = 1L
+)
+write.csv(timeseries, file = file.path(p$scen$BASE$switch, "inputs/timeseries.csv"), 
+          row.names = FALSE, quote = FALSE)
+timeseries
+stopifnot(!any(is.na((timeseries))))
+```
+
+
+### switch: timepoints.csv
+
+```{r}
+#| eval: !expr params$build_switch
+
+timepoints_map <- tibble(
+  year = p$base_year, # assuming one year (temporary solution)
+  slice = timedim$timepoints,
+  timepoint_id = 
+    paste(p$base_year,
+      rep(
+        timedim$timepoints,
+        length(timeseries$TIMESERIES)
+      ), sep = "_"
+  ),
+  timeseries = rep(
+    timeseries$TIMESERIES, 
+    each = length(timedim$timepoints)
+  ),
+  timestamp = "."
+) |>
+  left_join(timedim, by = "slice")
+timepoints <- timepoints_map |> select(timepoint_id, timeseries, timestamp)
+stopifnot(!any(is.na((timepoints))))
+write.csv(timepoints, file = file.path(p$scen$BASE$switch, "inputs/timepoints.csv"),
+          row.names = FALSE, quote = FALSE)
+head(timepoints)
+```
+
+## Commodities / carriers / energy sources
+
+Commodities (energyRt) / carriers (PyPSA) / energy sources\* (Switch)\
+\* Switch recognizes **fuels** and **non-fuel energy sources**.
+
+Key objects (created in the chunk below):\
+`comm` - a table with names of carriers, commodities
+
+```{r}
+# names of commodities
+carriers <- nc$carriers |>
+  mutate(
+    comm = carriers2comm(toupper(carriers_i)),
+    drop = duplicated(comm) | is.na(comm)
+  )
+
+# drop duplicates, ...
+comm <- filter(carriers, !drop) |>
+  # assign storage-commodity, slice-level, and supplied (market) commodity
+  mutate(
+    stg = grepl("HYD|PHS|H2|HGN|BTR", comm), # storage-commodity
+    timeframe = if_else(stg, "HOUR", "ANNUAL"), # slice-level
+    # limtype = if_else(stg, "", ""), # storage type
+    sup = grepl("ANNUAL", timeframe), # supplied commodity
+    switch_nonfuel = carriers_co2_emissions == 0
+  )
+```
+
+### energyRt: commodities
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+# create commodities objects
+ELC <- newCommodity("ELC", timeframe = "HOUR")
+CO2 <- newCommodity("CO2", timeframe = "ANNUAL")
+repo_comm <- newRepository("commodities", ELC, CO2)
+if (nrow(comm) > 0) {
+  for (i in 1:nrow(comm)) {
+    com <- newCommodity(
+      name = comm$comm[i],
+      desc = comm$carriers_nice_name[i],
+      timeframe = comm$timeframe[i],
+      misc = list(color = comm$carriers_color[i])
+    )
+    if (comm$carriers_co2_emissions[i] != 0) {
+      com <- update(com, 
+                    emis = list(comm = "CO2", 
+                                emis = comm$carriers_co2_emissions[i]))
+    }
+    repo_comm <- add(repo_comm, com)
+    rm(com)
+  }
+} 
+repo_comm@data |> names()
+```
+
+### switch: fuels.csv
+
+Fuels in Switch model are energy sources with associated costs (by year and region, see "fuel_costs" module) and CO2 intensity. They cannot (!!!or can?) be considered as variable an energy source (example: coal, gas, biofuel).
+
+```{r}
+#| eval: !expr params$build_switch
+
+fuels <- comm |>
+  filter(!switch_nonfuel | grepl("H2|BIO|NUC", comm)) |>
+  mutate(
+    fuel = comm,
+    co2_intensity = carriers_co2_emissions,
+    upstream_co2_intensity = 0.
+  ) |>
+  select(fuel, co2_intensity, upstream_co2_intensity)
+stopifnot(!any(is.na((fuels))))
+write.csv(fuels, file = file.path(p$scen$BASE$switch, "inputs/fuels.csv"),
+          row.names = FALSE, quote = FALSE)
+fuels
+```
+
+
+### switch: non_fuel_energy_sources.csv
+
+This type indicates that the energy source can be variable (if declared in "gen_info" module and "variable_capacity_factors"); they don't have associated costs, energy markets. Typical example: wind energy, solar energy, electricity.\
+Energy sources with (no costs in the model) and without variable capacity factors can be declared either as fuels or non-fuels. All declarations should be done only once.
+
+```{r}
+#| eval: !expr params$build_switch
+
+## switch: non_fuel_energy_sources.csv ####
+non_fuel_energy_sources <- comm |>
+  filter(!(comm %in% fuels$fuel)) |>
+  rename(energy_source = comm) |>
+  select(energy_source) |>
+  bind_rows(
+    tibble(
+      energy_source = c("Electricity")
+    )) # ??? can it be ELC?
+
+stopifnot(!any(is.na((non_fuel_energy_sources))))
+write.csv(non_fuel_energy_sources, 
+          file = file.path(p$scen$BASE$switch, "inputs/non_fuel_energy_sources.csv"),
+          row.names = FALSE, quote = FALSE)
+non_fuel_energy_sources
+```
+
+## Supply / markets
+
+Supply (energyRt) / markets (Switch)
+
+```{r}
+supp <- comm |> filter(sup)
+```
+
+### energyRt: supply
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_sup <- newRepository("supply")
+for (i in 1:nrow(supp)) {
+  sup <- newSupply(
+    name = paste0("SUP_", supp$comm[i]),
+    commodity = supp$comm[i]
+    # desc = supp$carriers_nice_name[i],
+  )
+  # !!! update costs?
+  repo_sup <- add(repo_sup, sup)
+  rm(sup)
+}
+repo_sup@data |> names()
+```
+
+### switch: fuel_cost.csv
+
+```{r}
+#| eval: !expr params$build_switch
+
+fuel_cost <- expand_grid(
+  load_zone	= reg_names$region, 
+  fuel = fuels$fuel, # ??? can non-fuels be here?
+  period = periods$INVESTMENT_PERIOD,
+) |>
+mutate(
+  fuel_cost = 0. # ??? No data in nc.file. Included in marginal costs?
+)
+
+write.csv(fuel_cost, 
+          file = file.path(p$scen$BASE$switch, "inputs/fuel_cost.csv"),
+          row.names = FALSE, quote = FALSE)
+cat("file: inputs/fuel_cost.csv")
+fuel_cost
+stopifnot(!any(is.na(fuel_cost)))
+```
+
+## Demand / load profiles
+
+Demand (energyRt) / loads (PyPSA & Switch) profiles
+```{r}
+dem <- nc$loads |>
+  left_join(reg_names, by = c(loads_t_p_set_i = "bus")) |>
+  left_join(timedim, by = "snapshots") |>
+  mutate(
+    yday = as.integer(str_extract(slice, "[0-9]++")),
+    hour = as.integer(str_extract(slice, "[0-2][0-9]$")))
+
+loads_byday <- dem |>
+  group_by(hour, region) |>
+  summarise(
+    load_min = min(loads_t_p_set),
+    load_max = max(loads_t_p_set),
+    load_mean = mean(loads_t_p_set),
+    .groups = "drop"
+  )
+
+fig_loads_hour <- ggplot(dem) +
+  geom_line(aes(x = hour, y = loads_t_p_set/1e3, color = yday, group = yday),
+            alpha = .5) +
+  # geom_ribbon(aes(hour, ymin = load_min, ymax = load_max)) +
+  scale_color_viridis_c(option = "H", name = "yday") +
+  facet_wrap(~ region, ncol = 1, scales = "free_y", strip.position = "right") + 
+  labs(x = "hour", y = "GWh", 
+       title = "Hourly load profile by day of the year") +
+  rev_theme_map()
+
+fig_loads_yday <- ggplot(dem) +
+  geom_line(aes(x = yday, y = loads_t_p_set/1e3, color = hour, group = hour),
+            alpha = .5) +
+  # geom_ribbon(aes(hour, ymin = load_min, ymax = load_max)) +
+  scale_color_viridis_c(option = "D", name = "hour", limits = c(0, 23)) +
+  facet_wrap(~ region, ncol = 1, scales = "free_y", strip.position = "right") + 
+  labs(x = "day of year (yday)", y = "GWh", 
+       title = "Load profile by day of year and hour") +
+  rev_theme_map()
+```
+
+```{r}
+#| fig.height: 8
+#| echo: false
+fig_loads_hour
+```
+
+```{r}
+load_by_reg <- dem |>
+  group_by(region) |>
+  summarise(
+    GWh = sum(loads_t_p_set, na.rm = T) / 1e3,
+    .groups = "drop"
+  )
+
+load_by_reg_sf <- gis_sf |>
+  left_join(load_by_reg, by = "region")
+  
+fig_load_by_reg_sf <- ggplot(load_by_reg_sf) +
+  geom_sf(aes(fill = GWh)) +
+  scale_fill_viridis_c(option = "B") +
+  labs(title = "Annual load by region/cluster") +
+  rev_theme_map()
+```
+
+```{r}
+#| echo: false
+fig_load_by_reg_sf
+```
+
+### energyRt: demand
+
+```{r}
+DEMELC <- newDemand(
+  name = "DEMELC",
+  desc = "loads_t_p_set",
+  commodity = "ELC",
+  unit = "MWh",
+  dem = list(
+    region = dem$region,
+    slice = dem$timepoints,
+    dem = dem$loads_t_p_set
+  )
+)
+```
+
+### switch: loads.csv
+
+```{r}
+#| eval: !expr params$build_switch
+
+loads <- dem |>
+  left_join(
+    select(timepoints_map, slice, timepoint_id),
+    by = c(timepoints = "slice")) |>
+  mutate(
+    LOAD_ZONE = region,
+    TIMEPOINT = timepoint_id,
+    zone_demand_mw = loads_t_p_set
+  ) |>
+  select(LOAD_ZONE, TIMEPOINT, zone_demand_mw)
+stopifnot(!any(is.na((loads))))
+write.csv(loads, file = file.path(p$scen$BASE$switch, "inputs/loads.csv"), 
+          row.names = FALSE, quote = FALSE)  
+loads
+```
+
+## Power network
+
+```{r}
+network <- nc$lines |> 
+  left_join(reg_nodes, by = c("lines_bus0" = "bus")) |>
+  left_join(reg_nodes, by = c("lines_bus1" = "bus")) |>
+  mutate(
+    losses = round(0.05 * lines_length / 1000, 3),
+    trd_name = paste("TRL", region.x, region.y, sep = "_")
+    ) # assuming 5% losses per 1000 km
+
+net_map <- model_map +
+  geom_segment(aes(x = lon.x, y = lat.x, xend = lon.y, yend = lat.y), 
+               data = network, color = "dodgerblue", linewidth = 2) +
+  geom_point(aes(lon, lat), data = reg_nodes, col = "red") +
+  geom_label_repel(aes(lon, lat, label = bus), data = reg_nodes, alpha = 0.7)
+
+```
+
+### energyRt: trade
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_network <- newRepository("network")
+if (nrow(network) > 0) {
+  for (i in 1:nrow(network)) {
+    trd <- newTrade(
+      name = network$trd_name[i],
+      desc = network$lines_type[i],
+      commodity = "ELC",
+      routes = data.frame(
+        src = c(network$region.x[i], network$region.y[i]),
+        dst = c(network$region.y[i], network$region.x[i])
+      ),
+      trade = data.frame(
+        src = c(network$region.x[i], network$region.y[i]),
+        dst = c(network$region.y[i], network$region.x[i]),
+        teff = rep(1 - network$losses[i], 2)
+      ),
+      capacityVariable = T,
+      invcost = data.frame(
+        # costs can be assigned to one of the connected region or both
+        # here we split the costs, 50% for each region
+        region = c(network$region.x[i], network$region.y[i]),
+        invcost = rep(network$lines_capital_cost[i] / 2, 2) * 2 # olife == 2
+      ),
+      olife = 2, # doubled annualized invcost for consistency 
+      stock = data.frame(
+        # year = 
+        stock = network$lines_s_nom[i]
+      ),
+      cap2act = 24*365
+    )
+    repo_network <- add(repo_network, trd)
+    rm(trd)
+  }
+}
+names(repo_network@data)
+```
+
+### switch: transmission_lines.csv
+
+Switch model considers transmission lines bi-directional. Key parameters:
+
+```{r}
+#| eval: !expr params$build_switch
+
+transmission_lines <- tibble(
+  TRANSMISSION_LINE = network$trd_name,
+  trans_lz1 = network$region.x,
+  trans_lz2 = network$region.y,
+  trans_length_km = network$lines_length,
+  trans_efficiency = 1 - network$losses,
+  existing_trans_cap = network$lines_s_nom,
+  trans_new_build_allowed = network$lines_s_nom_extendable
+)
+transmission_lines
+
+write.csv(transmission_lines, 
+          file = file.path(p$scen$BASE$switch, "inputs/transmission_lines.csv"), 
+          row.names = FALSE, quote = FALSE)  
+stopifnot(!any(is.na((transmission_lines))))
+```
+
+```{r}
+#| echo: false
+net_map
+
+# ggsave("tmp/network.png", net_map, scale = 2, width = 3.5, height = 4)
+```
+
+## Solar capacity factors
+
+Weather factors (energyRt) / renewable profiles (PyPSA) / variable_capacity_factors (Switch).
+
+```{r}
+solar <- nc$generators_cf |>
+  # filter(grepl("[0-9] solar$", generators_t_p_max_pu_i)) |>
+  filter(grepl(" solar$", generators_t_p_max_pu_i)) |>
+  rename(cf = generators_t_p_max_pu) |>
+  mutate( # !!! ToDo: write functions !!!
+    # bus = str_extract(generators_t_p_max_pu_i, "[A-Z]+.[0-9]+"),
+    bus = str_replace(generators_t_p_max_pu_i, " solar$", ""),
+    tech_pypsa = str_trim(str_replace(generators_t_p_max_pu_i, bus, "")),
+    tech = "ESOL", # assuming one technology per region
+    weather = "WSOL"
+    ) |>
+  left_join(reg_names, by = "bus") |>
+  left_join(timedim, by = "snapshots") |>
+  as.data.table()
+
+  if (is.null(solar$offshore)) {
+    solar[, offshore := FALSE]
+  }
+```
+
+### (Optional) replace with MERRA2 data
+
+```{r}
+#| eval: !expr params$use_merra_data
+
+if (params$use_merra_data) {
+  # win_cl_mask <- rev_merra_cl_filemask(p$win_cl_tol)
+  # # sol_cl_mask <- rev_merra_cl_filemask(p$sol_cl_tol)
+  p$files$merra_sol <- 
+    fp(p$dir$data_mod, glue("merra_sol_{sol_cl_mask}_{p$weather_year}.fst"))
+
+  cf_sol <- read_fst(p$files$merra_sol, as.data.table = T) |>
+    filter(cluster <= p$sol_cl_max) |> as.data.table()
+    
+  # (load(file.path(p$dir$data, "merra", "sol_sf.RData")))
+  unique(cf_sol$cluster)
+  
+  # drop offshore data
+  if (is.null(cf_sol$offshore)) {
+    cf_sol[, offshore := F]
+  }
+
+  sol_cf <- solar |> 
+    left_join(cf_sol, by = c("region" = "reg_off", "offshore", "slice")) |>
+    # left_join(filter(cf_win, !offshore)) |>
+    filter(!is.na(offshore)) |> # drop regions with no data (low potential)
+    select(-cf) |>
+    rename(cf = scf_tl) |>
+    select(-starts_with("scf_"), -year) |>
+    mutate(
+      tech = make_tech_name(tech, as.integer(cluster)),
+      weather = make_tech_name(weather, as.integer(cluster))
+    )
+  
+  # 
+  pypsa_update_solar <- sol_cf |> 
+    replace_na(list(cf = 0)) |>
+    select(generators_t_p_max_pu_i, snapshots, cf) |>
+    rename(generators_t_p_max_pu = cf)  
+  
+  sol_cf$cf |> summary()
+  sol_cf$offshore |> summary()
+  solar <- sol_cf
+}
+
+```
+
+\[ToDo:: make by cluster\]
+
+```{r}
+#| echo: false
+
+# if (is.null(solar$offshore)) solar$offshore <- FALSE
+solar_cf <- solar |>
+  group_by(across(any_of(c("region", "reg_off", "offshore")))) |>
+  summarise(
+    cf = mean(cf, na.rm = T), 
+    .groups = "drop"
+  )
+
+solar_cf_sf <- gis_sf |>
+  full_join(
+    solar_cf
+    # by = "region", 
+    # relationship = "many-to-many"
+  )
+
+fig_solar_cf_sf <- ggplot(solar_cf_sf) +
+  geom_sf(aes(fill = cf)) +
+  scale_fill_viridis_c(name = "CF", option = "C") +
+  labs(title = "Solar annual average capacity factor") +
+  rev_theme_map()
+
+fig_solar_cf_sf
+```
+
+### energyRt: weather factors (solar)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_solar_cf <- newRepository("repo_solar_cf")
+if (nrow(solar) > 0) {
+  for (w in unique(solar$weather)) {
+    x <- filter(solar, weather %in% w, !offshore)
+    WSOL <- newWeather(
+      name = w,
+      desc = "Solar generation profile",
+      timeframe = "HOUR",
+      weather = data.frame(
+        region = x$region,
+        slice = x$timepoints,
+        wval = x$cf
+      )
+    )
+    repo_solar_cf <- add(repo_solar_cf, WSOL); rm(WSOL)
+  }
+}
+repo_solar_cf@data |> names()
+```
+
+### switch: variable_capacity_factors (solar)
+
+```{r}
+#| eval: !expr params$build_switch
+
+variable_capacity_factors_ESOL <- solar |>
+  left_join(timepoints_map, by = c("timepoints" = "slice")) |>
+  rename(
+    timepoint = timepoint_id,
+    gen_max_capacity_factor = cf
+  ) |>
+  mutate(
+    GENERATION_PROJECT = paste0(region, "_", tech)
+  ) |>
+  select(GENERATION_PROJECT, timepoint, gen_max_capacity_factor)
+variable_capacity_factors_ESOL
+```
+
+## Onshore wind capacity factors
+
+```{r}
+onwind <- nc$generators_cf |>
+  filter(grepl("onwind$", generators_t_p_max_pu_i)) |>
+  rename(wind_cf = generators_t_p_max_pu) |>
+  mutate( # !!! ToDo: write functions !!!
+    # bus = str_extract(generators_t_p_max_pu_i, "[A-Z]+.[0-9]+"),
+    bus = str_replace(generators_t_p_max_pu_i, " onwind$", ""),
+    tech_pypsa = str_trim(str_replace(generators_t_p_max_pu_i, bus, "")),
+    tech = "EWIN", # assuming one technology per region
+    weather = "WWIN") |>
+  left_join(reg_names, by = "bus") |>
+  left_join(timedim, by = "snapshots") |>
+  mutate(offshore = FALSE)
+
+```
+
+### (Optional) replace with MERRA2 data
+
+```{r}
+#| eval: !expr params$use_merra_data
+win_cl_mask <- rev_merra_cl_filemask(p$win_cl_tol)
+p$files$merra_win <- 
+  fp(p$dir$data_mod, glue("merra_win_{win_cl_mask}_{p$weather_year}.fst"))
+
+cf_win <- read_fst(p$files$merra_win, as.data.table = T) |>
+  filter(cluster <= p$win_cl_max) |> as.data.table()
+
+if (is.null(cf_win$offshore)) cf_win[, offshore := grepl("_off$", reg_off)]
+summary(cf_win$offshore) # check if there is offshore data
+# if (!params$add_wind_offshore) 
+cf_wif <- cf_win[offshore == T] # separate offshore data
+cf_win <- cf_win[offshore == F]
+
+onwind_merra <- onwind |> 
+  mutate(offshore = FALSE) |>
+  left_join(cf_win, by = c("region" = "reg_off", "slice", "offshore")) |>
+  # filter(!offshore) |>
+  select(-wind_cf) |>
+  rename(wind_cf = wcf100m) |> #!!! rename wind_cf and cf_win
+  select(-starts_with("wcf"), -year) 
+
+onwind_merra$wind_cf |> summary()
+# onwind_merra$offshore |> summary()
+onwind_merra$region |> unique()
+onwind_merra$generators_t_p_max_pu_i |> unique()
+
+if (p$update_pypsa_model) {
+  # option #1 - replace NA's with zeros 
+  pypsa_update_onwind <- onwind_merra |> 
+    replace_na(list(wind_cf = 0)) |>
+    select(generators_t_p_max_pu_i, snapshots, wind_cf) |>
+    rename(generators_t_p_max_pu = wind_cf)
+
+  if (F) {# option #2 - keep original PyPSA data for missing techs (NA's)
+    onwind_merra |> 
+      select(generators_t_p_max_pu_i, snapshots, wind_cf) |>
+      rows_patch(
+        select(onwind, generators_t_p_max_pu_i, snapshots, wind_cf), 
+        by = c("generators_t_p_max_pu_i", "snapshots")
+      )
+  }
+}
+
+# overwrite
+onwind <- onwind_merra |>
+  filter(!is.na(cluster)) |> # drop regions w/o data (low potential)
+  mutate(
+    tech = make_tech_name(tech, as.integer(cluster)),
+    weather = make_tech_name(weather, as.integer(cluster))
+  )  
+
+```
+
+!!! - make by clusters
+
+```{r}
+#| ehco: false
+
+# if (is.null(onwind$offshore)) onwind$offshore <- FALSE
+onwind_cf <- onwind |>
+  group_by(region, offshore) |>
+  summarise(
+    cf = mean(wind_cf, na.rm = T), 
+    .groups = "drop"
+  )
+onwind_cf_sf <- gis_sf |>
+  full_join(
+    onwind_cf,
+    # by = "region", 
+    relationship = "many-to-many") |>
+  mutate(
+    reg_off = paste(region, if_else(offshore, "off", ""), sep = "_")
+  )
+
+fig_onwind_cf_sf <- ggplot(onwind_cf_sf) +
+  geom_sf(aes(fill = cf)) +
+  scale_fill_viridis_c(name = "CF", option = "D") +
+  labs(title = "Wind annual average capacity factor") +
+  rev_theme_map()
+
+fig_onwind_cf_sf
+```
+
+### energyRt: weather factors (onshore wind)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_onwind_cf <- newRepository("repo_onwind_cf")
+if (nrow(onwind) > 0) {
+  for (w in unique(onwind$weather)) {
+    x <- filter(onwind, weather %in% w)
+    WWIN <- newWeather(
+      name = w,
+      desc = "Onshore wind generation profile",
+      timeframe = "HOUR",
+      weather = data.frame(
+        region = x$region,
+        slice = x$timepoints,
+        wval = x$wind_cf
+      )
+    )
+    repo_onwind_cf <- add(repo_onwind_cf, WWIN); rm(WWIN)
+  }
+}
+repo_onwind_cf@data |> names()
+```
+
+### switch: variable_capacity_factors (onshore wind)
+
+```{r}
+#| eval: !expr params$build_switch
+
+variable_capacity_factors_EWIN <- onwind |>
+  left_join(timepoints_map, by = c("timepoints" = "slice")) |>
+  rename(
+    timepoint = timepoint_id,
+    gen_max_capacity_factor = wind_cf
+  ) |>
+  mutate(
+    GENERATION_PROJECT = paste0(region, "_EWIN")
+  ) |>
+  select(GENERATION_PROJECT, timepoint, gen_max_capacity_factor)
+variable_capacity_factors_EWIN
+```
+
+## Hydro (ror) capacity factors
+
+```{r}
+ror <- nc$generators_cf |>
+  # filter(grepl("[0-9] ror$", generators_t_p_max_pu_i)) |>
+  filter(grepl(" ror$", generators_t_p_max_pu_i)) |>
+  mutate( # !!! ToDo: write functions !!!
+    # bus = str_extract(generators_t_p_max_pu_i, "[A-Z]+.[0-9]+"),
+    bus = str_extract(generators_t_p_max_pu_i, " ror$"),
+    tech_pypsa = str_trim(str_replace(generators_t_p_max_pu_i, bus, "")),
+    tech = "EROR", # assuming one technology per region
+    weather = "WROR") |>
+  left_join(reg_names, by = "bus") |>
+  left_join(timedim, by = "snapshots")
+
+unique(ror$generators_t_p_max_pu_i)
+unique(ror$bus)
+ror_cf_sf <- ror |>
+  group_by(region) |>
+  summarise(
+    cf = mean(generators_t_p_max_pu, na.rm = T), 
+    .groups = "drop"
+  )
+ror_cf_sf <- gis_sf |>
+  full_join(
+    ror_cf_sf,
+    by = "region")
+
+fig_ror_cf_sf <- ggplot(ror_cf_sf) +
+  geom_sf(aes(fill = cf)) +
+  scale_fill_viridis_c(name = "CF", option = "D") +
+  labs(title = "Hydro (ROR) annual average capacity factor") +
+  rev_theme_map()
+
+```
+
+```{r}
+#| echo: false
+fig_ror_cf_sf
+```
+
+### energyRt: weather factors (run of river)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_ror_cf <- newRepository("repo_ror_cf")
+if (nrow(ror) > 0) {
+  for (w in unique(ror$weather)) {
+    x <- filter(ror, weather %in% w)
+    WROR <- newWeather(
+      name = w,
+      desc = "Run of river hydro generation profile",
+      timeframe = "HOUR",
+      weather = data.frame(
+        region = x$region,
+        slice = x$timepoints,
+        wval = x$generators_t_p_max_pu
+      )
+    )
+    repo_ror_cf <- add(repo_ror_cf, WROR); rm(WROR)
+  }
+}
+repo_ror_cf@data |> names()
+
+```
+
+### switch: variable_capacity_factors (run of river)
+
+```{r}
+#| eval: !expr params$build_switch
+
+variable_capacity_factors_EROR <- ror |>
+  left_join(timepoints_map, by = c("timepoints" = "slice")) |>
+  rename(
+    timepoint = timepoint_id,
+    gen_max_capacity_factor = generators_t_p_max_pu
+  ) |>
+  mutate(
+    GENERATION_PROJECT = paste0(region, "_EROR")
+  ) |>
+  select(GENERATION_PROJECT, timepoint, gen_max_capacity_factor)
+variable_capacity_factors_EROR
+```
+
+### switch: variable_capacity_factors.csv
+
+Combine all capacity factors of variable technologies and write the csv-file.
+
+```{r}
+#| eval: !expr params$build_switch
+
+variable_capacity_factors <- variable_capacity_factors_ESOL |>
+  rbind(variable_capacity_factors_EWIN) |>
+  rbind(variable_capacity_factors_EROR)
+
+# checks
+variable_capacity_factors |> summary()
+variable_capacity_factors$GENERATION_PROJECT |> unique()
+str_replace(variable_capacity_factors$GENERATION_PROJECT, 
+            "^([A-Z])+(|[0-9])+_", "") |> unique()
+# stopifnot(!any(is.na((variable_capacity_factors))  
+write.csv(variable_capacity_factors,
+          file = file.path(p$scen$BASE$switch, "inputs/variable_capacity_factors.csv"),
+          row.names = FALSE, quote = FALSE)
+variable_capacity_factors
+```
+
+## Hydro inflow
+
+Those time series can be used to control charging process in energyRt in storage or supply type of processes, or in generators in Switch or energyRt.
+
+```{r}
+inflow <- nc$storage_inflow |>
+  mutate( # !!! ToDO: write functions !!!
+    # bus = str_extract(storage_units_t_inflow_i, "[A-Z]+.[0-9]+"),
+    bus = str_replace(storage_units_t_inflow_i, " hydro", ""),
+    storage = str_trim(str_replace(storage_units_t_inflow_i, bus, "")),
+    comm = str_sub(toupper(storage), 1, 3),
+    stg = paste0("STG_", comm), # in the case it is used in storage class objects
+    sup = paste0("SUP_", comm), # in the case it is used in supply class objects
+    weather = paste0("W", comm)  # 
+  ) |>
+  left_join(reg_names, by = "bus") |>
+  left_join(timedim, by = "snapshots")
+
+if (nrow(inflow) > 0) {
+  unique(inflow$bus)
+  unique(inflow$stg)
+  unique(inflow$weather)
+
+  inflow_sf <- inflow |>
+    group_by(region) |>
+    summarise(
+      storage_units_t_inflow = mean(storage_units_t_inflow, na.rm = T), 
+      .groups = "drop"
+    )
+  inflow_sf <- gis_sf |>
+    full_join(
+      inflow_sf,
+      by = "region")
+  
+  fig_inflow_sf <- ggplot(inflow_sf) +
+    geom_sf(aes(fill = storage_units_t_inflow)) +
+    scale_fill_viridis_c(name = "", option = "D") +
+    labs(title = "Annual storage_units_t_inflow") +
+    rev_theme_map()
+}
+```
+
+```{r}
+#| echo: false
+try(fig_inflow_sf, silent = T)
+```
+
+### energyRt: weather factors (hydro storage inflow)
+
+```{r}
+#| eval: !expr params$build_energyRt
+repo_inflow <- newRepository("repo_inflow")
+if (nrow(inflow) > 0) {
+  for (w in unique(inflow$weather)) {
+    x <- filter(inflow, weather %in% w)
+    WHYD <- newWeather(
+      name = w,
+      desc = "Hydro inflow profile",
+      timeframe = "HOUR",
+      weather = data.frame(
+        region = x$region,
+        slice = x$timepoints,
+        wval = x$storage_units_t_inflow
+      )
+    )
+    repo_inflow <- add(repo_inflow, WHYD); rm(WHYD)
+  }
+}
+repo_inflow@data |> names()
+```
+
+## Generators
+
+```{r}
+gen <- nc$generators |>
+  # filter(grepl("[0-9] onwind$", generators_t_p_max_pu_i)) |>
+  mutate(
+    # bus = str_extract(generators_i, "[A-Z]+.[0-9]+"),
+    bus = str_replace(generators_i, " [:alnum:]+$", ""),
+    comm = carriers2comm(generators_i),
+    gen = str_replace(generators_i, bus, ""),
+    gen = str_trim(gen),
+    tech_name = substr(paste0("E", toupper(gen)), 1, 4), # !!! ToDo: Write a function
+    is_variable = ifelse(grepl("win|sol|ror", generators_i), TRUE, FALSE) #!!!
+  ) |>
+  left_join(reg_names, by = "bus")
+gen$tech_name[grepl("EONW", gen$tech_name)] <- "EWIN" # !!! ToDo: Write a function
+gen$tech_name |> unique()
+
+
+gen_sf <- gen |>
+  group_by(region, tech_name) |>
+  summarise(
+    GW = sum(generators_p_nom, na.rm = T)/1e3, 
+    GW_max = sum(generators_p_nom_max , na.rm = T)/1e3,
+    .groups = "drop"
+  ) |>
+  mutate(offshore = FALSE)
+
+if (params$use_merra_data) {
+  (load(file.path(p$dir$data_mod, "win_GW_max_tol99.RData")))
+  (load(file.path(p$dir$data_mod, "sol_GW_max_sf_tol99.RData")))
+  win_upd <- win_GW_max_sf |>
+    st_drop_geometry() |>
+    mutate(
+      # tech_name = "EWIN",
+      tech_name = make_tech_name("EWIN", as.integer(cluster)), 
+      # GW = as.numeric(NA),
+      .after = "region"
+    ) |>
+    mutate(GW_max = params$win_landuse_up * win_GW_max) |>
+    filter(!offshore) |>
+    select(all_of(c("region", "tech_name", "GW_max", "offshore"))) |>
+    unique()
+    # select(-offshore)
+  
+  sol_upd <- sol_GW_max_sf |>
+    st_drop_geometry() |>
+    mutate(
+      # tech_name = "ESOL",
+      tech_name = make_tech_name("ESOL", as.integer(cluster)), 
+      .after = "region"
+    ) |>
+    filter(!offshore) |>
+    mutate(GW_max = params$sol_landuse_up * sol_GW_max) |>
+    select(all_of(c("region", "tech_name", "GW_max", "offshore"))) |>
+    unique()
+    # select(-offshore)
+
+  gen_sf <- gen_sf |>
+      rows_update(win_upd, 
+                  unmatched = "ignore",
+                  by = c("region", "tech_name", "offshore")) |>
+      rows_update(sol_upd, 
+                  unmatched = "ignore",
+                  by = c("region", "tech_name", "offshore"))
+}
+
+gen_sf <- gis_sf |>
+  full_join(
+    gen_sf,
+    by = c("region", "offshore"),
+    relationship = "many-to-many") |>
+  filter(!is.na(tech_name))
+
+fig_gen_cap <- ggplot() +
+  geom_sf(data = gis_sf, fill = "wheat") +
+  geom_sf(aes(fill = GW), data = select(gen_sf, !offshore)) +
+  scale_fill_viridis_c(name = "GW", option = "H", limits = c(0, NA)) +
+  labs(title = "Existing (installed) generators, GW") +
+  facet_wrap(~tech_name) +
+  rev_theme_map() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), 
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+fig_gen_cap_max <- ggplot() +
+  geom_sf(data = gis_sf, fill = "wheat") +
+  geom_sf(aes(fill = GW_max), data = select(gen_sf, !offshore)) +
+  scale_fill_viridis_c(name = "GW", option = "H", limits = c(0, NA)) +
+  labs(title = "Maximum capacity by technology, GW") +
+  facet_wrap(~tech_name) +
+  rev_theme_map() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), 
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+```
+
+```{r}
+#| echo: false
+fig_gen_cap
+fig_gen_cap_max
+```
+
+### energyRt: technologies (generators)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_gen <- newRepository("generators")
+for (tch in unique(gen$tech_name)) {
+  # tch <- unique(gen$tech_name)[1]
+  tech <- NULL 
+  x <- gen |> filter(tech_name == tch)
+  if (p$use_tech_database) {
+    # try to import from the database
+    tech <- repo_pypsa_techs@data[[tch]] 
+    if (!inherits(tech, "technology")) {
+      message(tch, 
+              " does not exist in `repo_pypsa_techs`, building from scratch")
+    }
+  }
+  if (is.null(tech)) { 
+      tech <- newTechnology(
+        name = tch,
+        desc = x$generators_i[1],
+        # desc = paste(x$generators_i, collapse = ", "),
+        input = list(comm = unique(x$comm)),
+        output = list(comm = "ELC"),
+        cap2act = 24*365,
+        olife = list(olife = 100), # for 1-year model & annualized costs
+        region = unique(x$region),
+        ceff = list(
+          region = x$region,
+          comm = x$comm,
+          cinp2use = x$generators_efficiency
+        ),
+        fixom = list(
+          region = x$region,
+          fixom = x$generators_capital_cost # annualized
+          # invcost = x$generators_capital_cost # overnight
+        ),
+        varom = list(
+          region = x$region,
+          varom = x$generators_marginal_cost
+        ),
+        stock = list(
+          region = x$region,
+          stock = x$generators_p_nom
+        )
+      )
+    }
+  
+  # update pre-existing capacity (from PyPSA-model)
+  tech <- update(tech, stock = data.frame(
+    year = p$base_year,
+    region = x$region,
+    stock = x$generators_p_nom
+  ))
+  
+  # link with capacity factors (solar, wind, hydro)
+  # !!! add filter for missing capacity factors
+  if (grepl("sol", tch, ignore.case = T)) {
+    tech <- update(tech, weather = list(weather = "WSOL", waf.fx = 1))
+  } else if (grepl("win", tch, ignore.case = T)) {
+    tech <- update(tech, weather = list(weather = "WWIN", waf.fx = 1))
+  } else if (grepl("ror", tch, ignore.case = T)) {
+    tech <- update(tech, weather = list(weather = "WROR", waf.fx = 1))
+  }
+  
+  # availability of the technology for investment
+  extendable <- x$generators_p_nom_extendable
+  if (any(extendable != 1)) {
+    if (!any(extendable == 1 | extendable == 0)) {
+      # error in the data
+      print(x)
+      stop("Unexpected value in 'generators_p_nom_extendable' {0 or 1}")
+    }
+   tech <- update(
+     tech, 
+     end = list(
+       region = x$region,
+       end = if_else(
+         x$generators_p_nom_extendable == 1,
+         p$base_year + 50, # open for investment
+         p$base_year - 1 # not available for investment
+        )
+      )
+    )
+  }
+  repo_gen <- add(repo_gen, tech)
+}
+names(repo_gen@data)
+try(draw(repo_gen@data[[1]]))
+```
+
+### switch: gen_info (generators)
+
+```{r}
+#| eval: !expr params$build_switch
+
+gen_info_tech <- gen |>
+  mutate(
+    GENERATION_PROJECT = paste0(region, "_", tech_name),
+    gen_tech = tech_name,
+    gen_load_zone = region,
+    gen_connect_cost_per_mw = 0.,
+    gen_capacity_limit_mw = generators_p_nom_max, # ".",
+    gen_full_load_heat_rate = as.character(
+      round(
+        convert("GWh/GWh", "MMBtu/MWh", 1 / generators_efficiency), 3)),
+    gen_variable_om = generators_marginal_cost,
+    gen_max_age = 2, # !!! ToDo: convert to overnight costs
+    gen_is_variable = 
+      as.integer(
+        grepl("ECSP|ESPV|ESOL|EWIN|EWIF|EROR|EHYD", tech_name)), # !!! ToDo: Write function
+    gen_full_load_heat_rate = 
+      if_else(gen_is_variable == 1, ".", gen_full_load_heat_rate),
+    gen_is_baseload = as.integer(!as.logical(gen_is_variable)),
+    gen_is_cogen = 0L,
+    gen_energy_source	= comm,
+    gen_store_to_release_ratio = ".",
+    gen_storage_efficiency = ".",
+     # gen_unit_size	gen_ccs_capture_efficiency	gen_ccs_energy_load
+  )
+
+gen_info_tech$gen_full_load_heat_rate[
+  gen_info_tech$gen_is_variable == 1] <- "." 
+
+gen_info_tech$gen_capacity_limit_mw[
+  is.infinite(gen_info_tech$gen_capacity_limit_mw)] <- "."
+
+gen_info_csv <- gen_info_tech |>
+  select(GENERATION_PROJECT:gen_storage_efficiency)
+gen_info_csv$gen_tech |> unique()
+stopifnot(!any(is.na((gen_info_csv))))
+
+# drop techs with missing capacity factors
+
+```
+
+### switch: gen_build_predetermined (generators)
+
+```{r}
+#| eval: !expr params$build_switch
+
+if (nrow(gen_info_tech) > 0) {
+  gen_build_predetermined_tech <- gen_info_tech |>
+    filter(generators_p_nom > 0 | generators_p_nom_extendable == 0) |>
+    mutate(
+      build_year = p$base_year - 1,
+      build_gen_predetermined = generators_p_nom
+    ) |>
+    select(GENERATION_PROJECT, build_year, build_gen_predetermined)
+
+  gen_build_predetermined <- gen_build_predetermined_tech
+  # stopifnot(!any(is.na((gen_build_predetermined))))
+} else {
+  gen_build_predetermined <- NULL
+}
+```
+
+### switch: gen_build_costs (generators)
+
+```{r}
+#| eval: !expr params$build_switch
+
+gen_build_costs <- gen_info_tech |>
+  mutate(
+    build_year = NA,
+    gen_overnight_cost = 0L,
+    gen_fixed_om = generators_capital_cost,
+    # gen_overnight_cost = generators_capital_cost,
+    # gen_fixed_om = 0L,
+    gen_storage_energy_overnight_cost = "."
+  ) |>
+  select(GENERATION_PROJECT, build_year, gen_overnight_cost, gen_fixed_om,
+         gen_storage_energy_overnight_cost)
+
+# costs of existing stock
+gen_build_costs_0 <- gen_build_costs |>
+  filter(GENERATION_PROJECT %in% gen_build_predetermined$GENERATION_PROJECT) |>
+  mutate(
+    build_year = p$base_year - 1
+  )
+
+# investable 
+gen_build_costs_1 <- gen_build_costs |>
+  filter(
+    GENERATION_PROJECT %in% 
+      gen_info_tech$GENERATION_PROJECT[
+        gen_info_tech$generators_p_nom_extendable == 1]) |>
+  mutate(
+    build_year = p$base_year
+  )
+# merge
+gen_build_costs <- rbind(gen_build_costs_0, gen_build_costs_1)
+rm(gen_build_costs_0, gen_build_costs_1)
+gen_build_costs$GENERATION_PROJECT |> unique()
+
+stopifnot(!any(is.na((gen_build_costs))))
+head(gen_build_costs)
+```
+
+## Storage types
+
+There are several types of storage in the current PyPSA-Earth models:
+
+1.  **accumulators** (of a carrier):
+
+-   data table: `nc$stores`
+-   carrier: "battery" or "H2" (electricity or hydrogen)
+-   no existing capacity (can be added later)
+-   capital costs: `stores_capital_cost`
+-   efficiency: 100% (losses are modeled via "links": chargers and dischargers)
+
+2.  **pumped hydro**
+
+-   data table: `nc$storage_units`
+-   carrier: "PHS"
+-   `storage_units_capital_cost`
+-   `storage_units_efficiency_dispatch`
+-   `storage_units_efficiency_store` (!!!units? charging efficiency or storing?)
+
+3.  **hydro power plant (PP) with a dam** and *exogenous inflow*:
+
+-   data tables:
+    -   `nc$storage_units_set` - sets
+    -   `nc$storage_units` - parameters
+    -   `nc$storage_inflow` - exogenous inflow factors
+-   carrier: "hydro"
+-   `storage_units_p_nom` - existing electric capacity
+-   `storage_units_max_hours` - storage capacity parameter
+-   `storage_units_efficiency_dispatch`\
+    ***Note:** the listed types of storage are model/scenario-specific, not generic.*
+
+## Accumulators
+
+Modeled as a generic storage, the model optimizes energy capacity (MWh). Efficiency is assumed 100%, losses are modeled via links ("chargers" and "dischargers" for electricity, "electrolysis" and "fuel cells" for hydrogen).
+
+```{r}
+storage <- nc$stores |>
+  mutate(
+    # bus = str_extract(stores_bus, "[A-Z]+.[0-9]+"),
+    bus = str_replace(stores_bus, " [:alnum:]+$", ""),
+    comm = carriers2comm(stores_carrier),
+    stores = str_replace(stores_i, bus, ""),
+    stores = str_trim(stores),
+    # stg_name = paste0("STG_", toupper(stores))
+    # storage = str_trim(str_replace(storage_units_t_inflow_i, bus, "")),
+    comm = str_sub(toupper(stores), 1, 3),
+    stg = paste0("STG_", comm),
+    comm = str_replace(comm, "^BAT$", "ELC"),
+    stg = str_replace(stg, "_BAT", "_BTR")
+  ) |>
+  left_join(reg_names, by = "bus")
+# storage
+cat("Found", length(unique(storage$stg)), 
+    "stores (accumulators) for carriers:\n"); unique(storage$stores_carrier)
+cat("Storage technologies names to create in energyRt:\n"); unique(storage$stg)
+```
+
+### energyRt: storage (accumulators)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_stg <- newRepository("storages")
+if (nrow(storage) > 0) {
+  # s <- unique(storage$stg)[2]
+  for (s in unique(storage$stg)) {
+    x <- storage |> filter(stg == s)
+    stg <- NULL
+    if (p$use_tech_database) { # find in database
+      stg <- repo_pypsa_techs@data[[s]]
+      if (!inherits(stg, "storage")) {
+        message(s, 
+                " was not found in the `pypsa-technologies` dataset, \n",
+                "   building from scratch")
+        stg <- NULL
+      }
+    }
+    if (is.null(stg)) {
+      stg <- newStorage(
+        name = s,
+        # desc = paste(x$stores_i, collapse = ", "),
+        commodity = unique(x$comm),
+        # cap2act = 24*365,
+        region = unique(x$region),
+        olife = list(olife = 100), # for 1-year model & annualized costs
+        fixom = list(
+          region = x$region,
+          fixom = x$stores_capital_cost # annualized costs
+          # invcost = x$stores_capital_cost
+        )
+      )
+    }
+    
+  # availability of the technology for investment
+    extendable <- x$stores_e_nom_extendable
+    if (any(extendable != 1)) {
+      if (!any(extendable == 1 | extendable == 0)) { # check for errors
+        # error in the data
+        print(x)
+        stop("Unexpected value in 'stores_e_nom_extendable' {0 or 1}")
+      }
+      stg <- update(
+        stg, 
+        end = list(
+          region = x$region,
+          end = if_else(
+            x$stores_e_nom_extendable == 1,
+            p$base_year + 50, # open for investment
+            p$base_year - 1 # not available for investment
+          )
+        )
+      )
+    }    
+    repo_stg <- add(repo_stg, stg); rm(stg)
+  }
+}
+repo_stg@data |> names()
+```
+
+**Note:** Accumulators in Switch are modeled together with "links" (chargers and dischargers) below.
+
+## Pumped hydro (PHS)
+
+This type of storage in PyPSA-Earth has hydro as an `storage_units_carrier`. Though if availability of hydro is not linked with the ability to accumulate (!check!), then the modeling of the carrier can be avoided. The storage itself can be represented as an electricity storage with overall storage capacity equal to `storage_units_p_nom * storage_units_max_hours` in MWh where `storage_units_p_nom` is discharge capacity in MW. This approach is straightforward to reproduce in both Switch and energyRt. A version with hydro carrier can also be modeled, but may require advanced hydro module (will be considered later).
+
+```{r}
+unique(nc$storage_units$storage_units_carrier)
+phs <- nc$storage_units |>
+  filter(grepl("PHS", storage_units_carrier))
+if (nrow(phs) > 0) {
+  phs <- phs |>
+    mutate(
+      # bus = str_extract(stores_bus, "[A-Z]+.[0-9]+"),
+      bus = storage_units_bus,
+      # comm = carriers2comm(storage_units_carrier),
+      comm = "ELC", # consider as electricity storage
+      stores = str_replace(storage_units_i, bus, ""),
+      stores = str_trim(stores),
+      stg_name = paste0("STG_", toupper(stores)),
+      extendable = if_else(storage_units_capital_cost > 0, 1, 0) #!!! assumed
+    ) |>
+    left_join(reg_names, by = "bus")
+}
+```
+
+#### energyRt: storage (PHS)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_phs <- newRepository("phs")
+if (nrow(phs) > 0) {
+  for (s in unique(phs$stg_name)) {
+    x <- phs |> filter(stg_name == s)
+    stg <- newStorage(
+      name = s,
+      # desc = paste(x$stores_i, collapse = ", "),
+      commodity = list(comm = unique(x$comm)),
+      cap2stg = mean(x$storage_units_max_hours),
+      region = unique(x$region),
+      seff = list(
+        region = x$region,
+        inpeff = x$storage_units_efficiency_store,
+        outeff = x$storage_units_efficiency_dispatch
+      ),
+      olife = list(olife = 100), # for annualized costs
+      fixom = list(
+        region = x$region,
+        fixom = x$storage_units_capital_cost # using annualized costs
+      ),
+      # invcost = list(
+      #   region = x$region,
+      #   invcost = x$storage_units_capital_cost
+      # ),
+      stock = list(
+        region = x$region,
+        stock = x$storage_units_p_nom
+      )
+    )
+    if (any(x$extendable == 0)) { # availability on the market
+      stg <- update(
+        stg,
+        end = list(
+          region = x$region,
+          end = if_else(x$extendable == 1, 
+                        p$base_year,
+                        p$base_year - 1
+                        )
+        ))
+      
+    }
+    repo_phs <- add(repo_phs, stg); rm(stg)
+  }
+}
+repo_phs@data |> names()
+```
+
+#### switch: gen_info (PHS)
+
+Pumped hydro storage, adding to `gen_info` table.
+
+```{r}
+#| eval: !expr params$build_switch
+
+if (nrow(phs) > 0) {
+  gen_info_phs <- phs |>
+    mutate(
+      GENERATION_PROJECT = paste0(region, "_", stg_name),
+      gen_tech = stg_name,
+      gen_load_zone = region,
+      gen_connect_cost_per_mw = 0.,
+      gen_capacity_limit_mw = storage_units_p_nom, # ".",
+      gen_full_load_heat_rate = ".",
+      gen_variable_om = 0.,
+      gen_max_age = 2, 
+      gen_is_variable = 0.,
+      gen_full_load_heat_rate = ".",
+      gen_is_baseload = 0L,
+      gen_is_cogen = 0L,
+      gen_energy_source	= "PHS",
+      # gen_store_to_release_ratio = storage_units_max_hours,
+      gen_store_to_release_ratio = '.',
+      gen_storage_efficiency = 
+        storage_units_efficiency_store * storage_units_efficiency_dispatch
+       # gen_unit_size	gen_ccs_capture_efficiency	gen_ccs_energy_load
+    )
+  
+  # gen_info_tech$gen_full_load_heat_rate[
+  #   gen_info_tech$gen_is_variable == 1] <- "." 
+  
+  # gen_info_tech$gen_capacity_limit_mw[
+  #   is.infinite(gen_info_tech$gen_capacity_limit_mw)] <- "."
+  
+  gen_info_phs$gen_tech |> unique()
+  
+  gen_info_csv <- 
+    rbind(gen_info_csv, 
+    select(gen_info_phs, GENERATION_PROJECT:gen_storage_efficiency), 
+    use.names = T)
+} else {
+  gen_info_phs <- as.data.table(NULL)
+}
+
+```
+
+### switch: gen_build_predetermined (PHS)
+
+Pumped hydro storage, adding to `gen_build_predetermined` table.
+
+```{r}
+#| eval: !expr params$build_switch
+
+if (nrow(gen_info_phs) > 0) {
+  gen_build_predetermined_phs <- gen_info_phs |>
+    filter(storage_units_p_nom > 0) |>
+    mutate(
+      build_year = p$base_year - 1,
+      build_gen_predetermined = storage_units_p_nom
+    ) |>
+    select(GENERATION_PROJECT, build_year, build_gen_predetermined)
+  
+  # merge
+  gen_build_predetermined <- 
+    rbind(gen_build_predetermined,
+          gen_build_predetermined_phs,
+          use.names = T)
+  stopifnot(!any(is.na((gen_build_predetermined))))
+}
+```
+
+### switch: gen_build_costs (PHS)
+
+```{r}
+#| eval: !expr params$build_switch
+
+if (nrow(gen_info_phs) > 0) {
+  gen_build_costs_phs <- gen_info_phs |>
+    mutate(
+      build_year = NA,
+      # build_year = if_else(extendable == 1,
+      #                      p$base_year, # investable
+      #                      p$base_year - 1 # not investable
+      #                      ),
+      gen_overnight_cost = 0,
+      # gen_overnight_cost = ".",
+      gen_fixed_om = 0L,
+      gen_storage_energy_overnight_cost = storage_units_capital_cost
+    ) |>
+    select(GENERATION_PROJECT, build_year, gen_overnight_cost, gen_fixed_om,
+           gen_storage_energy_overnight_cost)
+  
+
+  # costs of existing stock
+  gen_build_costs_0 <- gen_build_costs_phs |>
+    filter(GENERATION_PROJECT %in% gen_info_phs$GENERATION_PROJECT) |>
+    mutate(
+      build_year = p$base_year - 1
+    )
+  
+  # investable 
+  gen_build_costs_1 <- gen_build_costs_phs |>
+    filter(
+      GENERATION_PROJECT %in% 
+        gen_info_phs$GENERATION_PROJECT[gen_info_phs$extendable == 1]) |>
+    mutate(
+      build_year = p$base_year
+    )
+  # merge
+  gen_build_costs_phs <- rbind(gen_build_costs_0, gen_build_costs_1)
+  rm(gen_build_costs_0, gen_build_costs_1)
+  
+  gen_build_costs_phs$GENERATION_PROJECT |> unique()
+  stopifnot(!any(is.na((gen_build_costs_phs))))
+  
+  gen_build_costs <- 
+    rbind(gen_build_costs,
+          gen_build_costs_phs,
+          use.names = T)
+  print(gen_build_costs_phs)
+}
+```
+
+## Hydro PP with a dam and exogenous inflow
+
+This type of technology has both generating and storing capacity, but its charging process is defined by third factors - the inflow of the water into the dam. Therefore the discharge (electricity generation) can be optimized based on the given load and inflow profile, and the storing capacity.
+
+```{r}
+unique(nc$storage_units$storage_units_carrier)
+hydro <- nc$storage_units |>
+  filter(grepl("hydro", storage_units_carrier)) 
+if (nrow(hydro) > 0) {
+  hydro <- hydro |>
+    mutate(
+      # bus = str_extract(stores_bus, "[A-Z]+.[0-9]+"),
+      bus = storage_units_bus,
+      comm = carriers2comm(storage_units_carrier),
+      stores = str_replace(storage_units_i, bus, ""),
+      stores = str_trim(stores),
+      stg = paste0("STG_", comm),
+      sup = paste0("RES_", comm),
+      tech = paste0("E", comm),
+      weather = paste0("W", comm),
+      extendable = 0L
+      # extendable = if_else(storage_units_capital_cost > 0, 1, 0) #!!! assumed
+    ) |>
+    left_join(reg_names, by = "bus")
+}
+
+# hydro
+```
+
+### energyRt: (hydro PP with a dam, variant #1)
+
+The most straightforward way to reproduce this type of process in energyRt is to model it with three classes: supply, storage, and technology.\
+The supply class will introduce the hydro commodity in the model with a given availability profile. Parameter `@weather$wava.fx` will fix the supply to a given time series (see `inflow` table in *Hydro storage inflow*).
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_hyddam <- newRepository("repo_hyddam", 
+                             desc = "Hydro with dam - v1")
+if (nrow(hydro) > 0) {
+  
+  #1. update commodity HYD
+  HYD <- repo_comm@data$HYD
+  repo_comm@data$HYD <- NULL # add to `repo_hyddam` repository
+  if (is.null(HYD)) HYD <- newCommodity(name = "HYD", 
+                                        desc = "Hydro energy")
+  
+  HYD <- update(HYD, 
+                # limtype = "FX", # 
+                timeframe = "HOUR"
+                )
+  # stopifnot(!any(unique(hydro$sup) %in% names(repo_sup@data))) ## check 
+  
+  for (s in unique(hydro$sup)) {
+    x <- filter(hydro, sup == s)
+    
+    #2. supply with weather factors
+    stopifnot(length(unique(x$weather)) == 1) # check for errors
+    RES_HYD <- newSupply(
+      name = s,
+      commodity = x$comm[1],
+      desc = paste0("Hydro resources"),
+      availability = data.frame(
+        region = x$region,
+        ava.fx = 1 # pegged to the weather factor
+      ),
+      weather = list(
+        weather = unique(x$weather),
+        wava.fx = 1
+      )
+    )
+
+    #3. generator (hydro turbine)
+    EHYD <- newTechnology(
+      name = "EHYD",
+      desc = "Hydro turbine connected to a dam",
+      input = list(comm = unique(x$comm)),
+      output = list(comm = "ELC"),
+      cap2act = 24*365,
+      region = unique(x$region),
+      ceff = list(
+        region = x$region,
+        comm = x$comm,
+        cinp2use = x$storage_units_efficiency_dispatch
+      ),
+      stock = list(
+        region = x$region,
+        stock = x$storage_units_p_nom 
+      ),
+      end = list(end = p$base_year - 1) #!!!ToDo: add checks
+    )
+    # draw(EHYD)
+
+    #4. storage
+    STG_HYD <- newStorage(
+      name = "STG_HYD",
+      desc = "Hydro dam",
+      # cap2stg = 
+      commodity = unique(x$comm),
+      cap2stg = 6,
+      region = unique(x$region),
+      stock = list(
+        region = x$region,
+        stock = x$storage_units_p_nom
+      ),
+      end = list(end = p$base_year - 1) #!!!ToDo add checks
+    )
+    
+    repo_hyddam <- add(repo_hyddam, HYD, RES_HYD, EHYD, STG_HYD)
+  }
+  rm(HYD, RES_HYD, EHYD, STG_HYD)
+  repo_hyddam@data |> names()
+}
+```
+
+### switch: (hydro PP with a dam, variant #1)
+
+This technology will be added on further steps
+
+```{r, eval=params$build_switch}
+
+```
+
+## Chargers and dischargers ("links" in PyPSA)
+
+```{r}
+link2tech <- function(x, ignore.case = T) { #!!! ToDo: write a function
+  # mapping of carriers to commodities
+  x[grepl("H2.Electrolysis", x, ignore.case = ignore.case)] <- "ELC2H2"
+  x[grepl("H2.Fuel.Cell", x, ignore.case = ignore.case)] <- "H2ELC"
+  x[grepl("battery.charger", x, ignore.case = ignore.case)] <- "ELC2BTR"
+  x[grepl("battery.discharger", x, ignore.case = ignore.case)] <- "BTR2ELC"
+  x
+}
+
+links <- nc$links |>
+  mutate(
+    # bus = str_extract(links_i, "[A-Z]+.[0-9]+"),
+    bus = rev_extract_bus(links_i),
+    tech = link2tech(links_carrier),
+    input = str_trim(str_replace(links_bus0, bus, "")),
+    input = carriers2comm(input),
+    input = if_else(input == "", "ELC", input),
+    output = str_trim(str_replace(links_bus1, bus, "")),
+    output = carriers2comm(output),
+    output = if_else(output == "", "ELC", output)
+    # tech_name = paste0("STG_", toupper(stores))
+  ) |>
+  left_join(reg_names, by = "bus")
+```
+
+### energyRt: technologies ("links" in PyPSA)
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo_links <- newRepository("links")
+if (nrow(links) > 0) {
+  for (nm in unique(links$tech)) {
+    x <- links |> filter(tech == nm)
+    tech <- newTechnology(
+      name = nm,
+      desc = x$links_carrier[1],
+      # desc = paste(x$links_i, collapse = ", "),
+      input = list(comm = unique(x$input)),
+      output = list(comm = unique(x$output)),
+      cap2act = 24*365,
+      region = unique(x$region),
+      ceff = list(
+        region = x$region,
+        comm = x$input,
+        cinp2use = x$links_efficiency
+      ),
+      olife = list(olife = 100), # doesn't matter for 1-year run and annualized inv
+      fixom = list(
+        region = x$region,
+        fixom = x$links_capital_cost # annualized costs
+      ),
+      # invcost = list(
+      #   region = x$region,
+      #   invcost = x$links_capital_cost
+      # ),
+      end = list(
+        region = x$region,
+        end = if_else(x$links_p_nom_extendable == 0, 
+                      p$base_year - 1, 
+                      p$base_year + 1)
+      )
+    )
+    repo_links <- add(repo_links, tech)
+    rm(tech)
+  }  
+}
+repo_links@data |> names()
+# repo_links@data$ELC2H2 |> draw()
+```
+
+### switch: storage (accumulators + links)
+
+```{r}
+#| eval: !expr params$build_switch
+
+# merge "links" and "storage" data tables, arranging by fuel type
+acc_links <- links |>
+  mutate(
+    stores_carrier = str_extract(links_i, "H2|battery"),
+    process = if_else(grepl("cell|discharger", links_carrier), "out", "inp")
+  ) |>
+  select(-(links_i:links_carrier), -(bus:output), -load_zones) |>
+  pivot_wider(
+    names_from = c(process), 
+    values_from = c(links_p_nom_extendable:links_capital_cost)) |>
+  as.data.table() |>
+  full_join(storage, by = c("region", "stores_carrier"))
+stopifnot(all(!is.na((acc_links))))
+```
+
+### gen_info (accumulators + links)
+
+Pumped hydro storage, adding to `gen_info` table.
+
+```{r}
+#| eval: !expr params$build_switch
+
+if (nrow(acc_links) > 0) {
+  gen_info_acc <- acc_links |>
+    mutate(
+      GENERATION_PROJECT = paste0(region, "_", stg),
+      gen_tech = stg,
+      gen_load_zone = region,
+      gen_connect_cost_per_mw = 0.,
+      gen_capacity_limit_mw = ".",
+      gen_full_load_heat_rate = ".",
+      gen_variable_om = 0.,
+      gen_max_age = 2, # see also 
+      gen_is_variable = 0.,
+      gen_full_load_heat_rate = ".",
+      gen_is_baseload = 0L,
+      gen_is_cogen = 0L,
+      gen_energy_source	= "Electricity", # == storage
+      gen_store_to_release_ratio = ".",
+      # gen_store_to_release_ratio = if_else(comm == "H2", 24 * 30, 6), # !!! assumption
+      gen_storage_efficiency = 
+        links_efficiency_inp  * links_efficiency_out
+       # gen_unit_size	gen_ccs_capture_efficiency	gen_ccs_energy_load
+    )
+  
+  gen_info_csv <-
+    rbind(gen_info_csv, 
+    select(gen_info_acc, GENERATION_PROJECT:gen_storage_efficiency), 
+    use.names = T)
+  stopifnot(all(!is.na((gen_info_csv))))
+}
+
+```
+
+### switch: gen_build_costs (accumulators + links)
+
+```{r}
+#| eval: !expr params$build_switch
+
+gen_build_costs_acc <- gen_info_acc |>
+  mutate(
+    build_year = p$base_year, # all in one
+    # gen_overnight_cost = links_capital_cost_inp + links_capital_cost_out,
+    gen_overnight_cost = 0L,
+    gen_fixed_om = links_capital_cost_inp + links_capital_cost_out,
+    gen_storage_energy_overnight_cost = stores_capital_cost * 
+      gen_info_acc$gen_max_age[1] # annualized -> overnight (roughly)
+      # 0L
+      ## links_capital_cost_inp + links_capital_cost_out +
+      # stores_capital_cost
+    # * gen_store_to_release_ratio, # !!! assumption
+  ) |>
+  select(GENERATION_PROJECT, build_year, gen_overnight_cost, gen_fixed_om,
+         gen_storage_energy_overnight_cost)
+gen_build_costs_acc$GENERATION_PROJECT |> unique()
+
+gen_build_costs <- gen_build_costs |>
+  rbind(gen_build_costs_acc, use.names = T)
+stopifnot(all(!is.na((gen_build_costs))))
+```
+
+```{r end_nc_import}
+#| include: false
+# close PyPSA-nc file
+try(nc_close(nc), silent = T)
+```
+
+## (optional) Update PyPSA-nc
+
+Update `p$files$pypsa_network` file with MERRA2 capacity factors and save in the same directory with `p$new_pypsa_file_ending`.
+
+```{r}
+#| eval: !expr params$update_pypsa_model
+
+if (F) { # (optional) study nc-file structure
+  # https://pjbartlein.github.io/REarthSysSci/netCDF.html
+  # https://ropensci.org/blog/2019/11/05/tidync/
+  library(tidync)
+  src <- tidync(p$files$pypsa_network)
+  print(src)
+  src <- src |> activate("generators_t_p_max_pu")
+  src |> activate("generators_i")
+  src |> activate("generators_t_p_max_pu_i") |> hyper_tibble() |>
+    as.data.table()
+  src |> activate("D12") |> hyper_tibble() |>
+  as.data.table()
+}
+
+if (p$update_pypsa_model) { # test writing to nc-file
+  library(ncdf4)
+  # new file name
+  p$files$pypsa_network_merra <- 
+    str_replace(p$files$pypsa_network, ".nc$", p$new_pypsa_file_ending)
+  
+  # copy nc-file (replacing previous copy with the same name)
+  file.copy(from = p$files$pypsa_network, to = p$files$pypsa_network_merra,
+            overwrite = TRUE)
+  
+  nc <- nc_open(p$files$pypsa_network_merra, write = TRUE)
+  # nc_close(nc)
+  # nc <- nc_open(file.path(p$dir$data_mod, 
+  #                         "elec_s_10_ec_lcopt_Co2L-1H-merra.nc"), 
+  #               write = T)
+  attributes(nc)$names
+  
+  # capacity factors
+  x <- ncvar_get(nc, "generators_t_p_max_pu")
+  class(x); 
+  dim(x); x[1:5, 1:5]; dimnames(x); 
+  
+  rownames(x) <- ncvar_get(nc, "generators_t_p_max_pu_i")
+  # ncvar_get(nc, "snapshots")
+  
+  # update
+  pypsa_update <- rbind(pypsa_update_onwind, pypsa_update_solar) |>
+    pivot_wider(names_from = "snapshots", 
+                values_from = "generators_t_p_max_pu")
+  rnam <- pypsa_update$generators_t_p_max_pu_i
+  cnam <- colnames(pypsa_update)[-1]
+  stopifnot(all(as.integer(cnam) == ncvar_get(nc, "snapshots"))) # check
+  pypsa_update <- pypsa_update |> select(-1) |> as.matrix()
+  dim(pypsa_update)
+  rownames(pypsa_update) <- rnam
+  
+  for (rn in rnam) {
+    i <- which(rownames(x) == rn)
+    x[i,] <- pypsa_update[rn,]
+  }
+
+  ncvar_put(nc, "generators_t_p_max_pu", x, verbose = T)
+  nc_close(nc)
+}
+```
+
+## switch: writing csv-files
+
+### checks
+
+Additional check to avoid switch error messages.
+
+#### variable techs data
+
+Check if variable capacity factors are available for all declared variable technologies.
+
+```{r}
+#| eval: !expr params$build_switch
+
+# all variable technologies
+var_gen <- gen_info_csv$GENERATION_PROJECT[gen_info_csv$gen_is_variable == 1]
+stopifnot(anyDuplicated(var_gen) == 0) # no duplicates
+var_gen <- unique(var_gen) |> sort()
+
+# all capacity factors
+var_cf <- unique(variable_capacity_factors$GENERATION_PROJECT) |> sort()
+
+# check if all variable techs has been declared in `gen_info`
+all_techs_declared <- all(var_cf %in% var_gen); all_techs_declared
+stopifnot(all_techs_declared)
+
+# check if capacity factors exist for all variable techs
+all_cf_in_data <- all(var_gen %in% var_cf); all_cf_in_data
+if (!all_cf_in_data) {
+  # identify missing capacity factors
+  ii <- !(var_gen %in% var_cf)
+  var_gen[ii]
+  if (params$force) {
+    # try to resolve by dropping technologies with missing var-cap-factors
+    ## 1. from `gen_info`
+    jj <- gen_info_csv$GENERATION_PROJECT %in% var_gen[ii]
+    if (any(jj)) {
+      message("Missing technologies in `gen_info`: ",
+              paste(gen_info_csv$GENERATION_PROJECT[jj], collapse = ", "))
+      warning("dropping technologies without variable capacity factors: \n",
+              paste(gen_info_csv$GENERATION_PROJECT[jj], collapse = ", "))
+      gen_info_csv <- gen_info_csv[!jj,]
+    }
+    
+    ## 2. from `gen_build_predetermined`
+    jj <- gen_build_predetermined$GENERATION_PROJECT  %in% var_gen[ii]
+    if (any(jj)) {
+      message("Missing technologies in `gen_build_predetermined`: ",
+              paste(gen_info_csv$GENERATION_PROJECT[jj], collapse = ", "))
+      warning("dropping from `gen_build_predetermined`: \n",
+              paste(gen_build_predetermined$GENERATION_PROJECT[jj], 
+                    collapse = ", "))
+      gen_build_predetermined <- gen_build_predetermined[!jj,]
+    }
+
+    ## 3. from `gen_build_costs`
+    jj <- gen_build_costs$GENERATION_PROJECT %in% var_gen[ii]
+    if (any(jj)) {
+      tch_ii <- paste(gen_build_costs$GENERATION_PROJECT[jj], collapse = ", ")
+      message("Missing info in `gen_build_costs` for:\n", tch_ii)
+      warning("dropping from `gen_build_costs`:\n", tch_ii)
+      gen_build_costs <- gen_build_costs[!jj,]
+    }
+    # gen_build_costs <- gen_build_costs[jj,]
+  } else {
+    # auto-correction is off - error exit
+    stop("Missing variable_capacity_factors for: ",
+         paste(var_gen[ii], collapse = " "))
+  }
+}
+```
+
+#### projects declared
+
+```{r}
+#| eval: !expr params$build_switch
+
+# gen_build_predetermined
+ii <- gen_build_predetermined$GENERATION_PROJECT %in%
+  gen_info_csv$GENERATION_PROJECT
+if (!all(ii)) {
+  message("GENERATION_PROJECTs in gen_build_predetermined")
+  print(gen_build_predetermined$GENERATION_PROJECT[!ii])
+  message("... have not been declared in gen_info")
+  # stop()
+}
+
+# gen_build_costs
+ii <- gen_build_costs$GENERATION_PROJECT %in% gen_info_csv$GENERATION_PROJECT
+if (!all(ii)) {
+  message("GENERATION_PROJECTs in gen_build_predetermined")
+  print(gen_build_costs$GENERATION_PROJECT[!ii])
+  message("... have not been declared in gen_info")
+  # stop()
+}
+
+```
+
+### switch: gen_info.csv
+
+```{r}
+#| eval: !expr params$build_switch
+
+stopifnot(all(!is.na((gen_info_csv))))
+write.csv(gen_info_csv,
+          file = file.path(p$scen$BASE$switch, "inputs/gen_info.csv"),
+          row.names = FALSE, quote = FALSE)
+```
+
+### switch: gen_build_predetermined.csv
+
+```{r}
+#| eval: !expr params$build_switch
+
+# add zeros to not-predetermined techs
+all_projects <- gen_info_csv$GENERATION_PROJECT |> unique()
+ii <- all_projects %in% unique(gen_build_predetermined$GENERATION_PROJECT)
+gen_build_predetermined_0 <- data.table(
+  GENERATION_PROJECT = all_projects[!ii],
+  build_year = p$base_year,
+  build_gen_predetermined = 0
+)
+gen_build_predetermined <- gen_build_predetermined |>
+  # rbind(gen_build_predetermined_0, use.names = T) |>
+  unique()
+stopifnot(all(!is.na((gen_build_predetermined))))
+write.csv(gen_build_predetermined,
+          file = file.path(p$scen$BASE$switch, "inputs/gen_build_predetermined.csv"),
+          row.names = FALSE, quote = FALSE)
+```
+
+### switch: gen_build_costs.csv
+
+```{r}
+#| eval: !expr params$build_switch
+stopifnot(all(!is.na((gen_build_costs))))
+write.csv(gen_build_costs,
+         file = file.path(p$scen$BASE$switch, "inputs/gen_build_costs.csv"),
+         row.names = FALSE, quote = FALSE)
+```
+
+### switch: financials.csv
+
+```{r}
+#| eval: !expr params$build_switch
+financials <- tibble(
+  base_financial_year	= periods$INVESTMENT_PERIOD,
+  discount_rate	= p$discount, # 0.0, #5/100,
+  interest_rate = p$discount #0.0, #7/100
+)
+stopifnot(all(!is.na((financials)))) 
+write.csv(financials,
+          file = file.path(p$scen$BASE$switch, "inputs/financials.csv"),
+          row.names = FALSE, quote = FALSE)
+financials
+```
+
+### switch: modules.txt
+
+```{r}
+#| eval: !expr params$build_switch
+fl <- file.path(p$scen$BASE$switch, "modules.txt")
+cat("# Core Modules", "\n", file = fl, append = FALSE)
+cat("switch_model", "\n", file = fl, append = TRUE)
+cat("switch_model.timescales", "\n", file = fl, append = TRUE)
+cat("switch_model.financials", "\n", file = fl, append = TRUE)
+cat("switch_model.balancing.load_zones", "\n", file = fl, append = TRUE)
+cat("switch_model.energy_sources.properties", "\n", file = fl, append = TRUE)
+cat("switch_model.generators.core.build", "\n", file = fl, append = TRUE)
+cat("switch_model.generators.core.dispatch", "\n", file = fl, append = TRUE)
+cat("switch_model.reporting", "\n", file = fl, append = TRUE)
+cat("# Custom Modules", "\n", file = fl, append = TRUE)
+cat("# switch_model.transmission.local_td", "\n", file = fl, append = TRUE)
+cat("switch_model.generators.core.no_commit", "\n", file = fl, append = TRUE)
+cat("# switch_model.energy_sources.fuel_costs.markets", "\n", file = fl, append = TRUE)
+cat("switch_model.energy_sources.fuel_costs.simple", "\n", file = fl, append = TRUE)
+cat("switch_model.transmission.transport.build", "\n", file = fl, append = TRUE)
+cat("switch_model.transmission.transport.dispatch", "\n", file = fl, append = TRUE)
+cat("switch_model.balancing.unserved_load", "\n", file = fl, append = TRUE)
+cat("switch_model.generators.extensions.storage", "\n", file = fl, append = TRUE)
+
+```
+
+### switch: switch_inputs_version.txt
+
+```{r}
+#| eval: !expr params$build_switch
+fl <- file.path(p$scen$BASE$switch, "inputs/switch_inputs_version.txt")
+cat("2.0.7", "\n", file = fl, append = TRUE)
+```
+
+### switch: solve
+
+```{r}
+#| eval: !expr params$solve_switch
+
+# "conda info --envs"
+fl <- file.path(p$scen$BASE$switch, "run_switch.cmd")
+# cat("cd ", normalizePath(dirname(fl)),"\n", file = fl, append = FALSE)
+cat("call activate switch", "\n", file = fl, append = FALSE)
+cat("switch solve --verbose --solver cplex --full-traceback --stream-solver",
+    "\n", file = fl, append = TRUE)
+cat("call conda deactivate", "\n", file = fl, append = TRUE)
+cat("cmd /k", "\n", file = fl, append = TRUE)
+
+print("switch: solve")
+# plan(multisession(workers = 2))
+# switch_eval <- future({
+system(fl, wait = F, invisible = F)
+# print("switch solve started")
+# })
+    
+# alternatively use the command in conda/python to run switch model:
+"switch solve --verbose --solver cplex --full-traceback --stream-solver"
+```
+
+## energyRt: model
+
+### (optional) cost of unserved load
+
+Capacity expansion models (energy systems in general) take load (final demand) as a given, exogenous level of electricity (demand-commodity) to deliver. Optimization of supply-side, capacity of generation and balancing technologies (and flexible demand structure when available) to serve the given level of load at any costs in every hour and every region. In the case when there is not enough resources to serve the load, the solution will be infeasible, the model will not converge to optimal solution.\
+To avoid this type of infeasibility and also study narrow places in the modeled resources, potential bags in the data, it is recommended to supply a cost of not delivering (unserving) the load. Hours and regions where the load is unserved indicate bottlenecks in the model, and subject for further investigation of the data and constraints.\
+`Switch` has an "switch_model.balancing.unserved_load" module that sets default 500 USD/MWh price on unserved load. (see above)\
+In `energyRt` one can put a dummy-technology or import of electricity with a certain cost that will be used if marginal production costs of electricity in particular hour and region will exceed the price. Below is an example of an unserved load modeled as an import.
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+EIMP5 <- newImport(
+  name = "EIMP",
+  desc = "Unserved load 5 USD per kWh",
+  commodity = "ELC",
+  imp = list(price = 500) 
+)
+
+EIMP10 <- newImport(
+  name = "EIMP",
+  desc = "Unserved load 10 USD per kWh",
+  commodity = "ELC",
+  imp = list(price = 1000) 
+)
+
+EIMP100 <- newImport(
+  name = "EIMP",
+  desc = "Unserved load 100 USD per kWh",
+  commodity = "ELC",
+  imp = list(price = 10000)
+)
+
+```
+
+### energyRt: assemble model
+
+```{r}
+#| eval: !expr params$build_energyRt
+
+repo <- newRepository("base") |>
+  add(
+    repo_comm, # main commodities
+    repo_sup,  # supply/resources
+    repo_gen,  # generators
+    repo_network, # inter-regional network
+    repo_stg, # storage (accumulators)
+    repo_phs, # pumped hydro
+    repo_hyddam, # hydro with a dam
+    repo_links, # chargers and dischargers (links) for storage
+    repo_inflow, # hydro inflow
+    repo_ror_cf, # run of river capacity factors
+    repo_onwind_cf, # onshore wind capacity factors
+    repo_solar_cf, # solar capacity factors
+    EIMP10, # optional price of unserved load
+    DEMELC # load curve
+  )
+
+# tst <- list(
+#   ANNUAL = "ANNUAL",
+#   YDAY = 
+# )
+# 
+# mod <- newModel(
+#   name = p$scen_name, 
+#   # desc = "Reproduced PyPSA model with MERRA2 cf in energyRt",
+#   ## in case of infeasibility, `dummy` variables can be added
+#   # debug = data.frame(#comm = "ELC",
+#   #                    dummyImport = 1e6,
+#   #                    dummyExport = 1e6),
+#   region = reg_names$region,
+#   discount = p$discount,
+#   slice = rev_data$timescales$energyRt_levels,
+#   repository = repo
+# )
+
+
+
+# mod <- setTimeSlices(mod, slice = rev_data$timescales$energyRt_levels)
+# mod@misc$gis <- gis
+# mod@misc$plots <- list(
+#   adm1_map = adm1_map,
+#   voronoi_map = voronoi_map
+# )
+
+# mod <- setMilestoneYears(mod, start = p$base_year, interval = 1)
+# mod@sysInfo@milestone # check
+# mod_path <- file.path(p$scen$BASE$root, "PyPSA_base_merra")
+# mod_path <- p$scen$BASE$root
+# dir.create(p$scen$BASE$root, showWarnings = F, recursive = T)
+# save(mod, #network, voronoi_map, reg_nodes,
+#      file = file.path(p$scen$BASE$root, "energyRt_model.RData"))
+
+# save repositories
+# ls(pattern = "repo_") # repositories
+# save(list = ls(pattern = "repo_"), 
+#      file = file.path(p$scen$BASE$root, "energyRt_repo.RData"))
+
+```
+
+### energyRt: solve
+
+```{r}
+#| eval: !expr params$solve_energyRt
+#| include: false
+
+# scen <- interpolate(mod, name = "PyPSA", trim = F)
+# save(mod, file = file.path(p$scen$BASE$root, "energyRt_model.RData"))
+scen_pypsa_base <- interpolate(mod, name = p$scen_name, trim = F)
+
+# try(source("tmp/gams_config.R"))
+source("tmp/solver_options.R")
+scen_pypsa_base_gams <- write(scen_pypsa_base, 
+                              solver = GAMS_parallel,
+                              # solver = GAMS_mac,
+                              tmp.dir = file.path(p$scen$BASE$root, "GAMS"))
+
+scen_pypsa_base_gams@misc$tmp.dir 
+
+solve(scen_pypsa_base_gams, wait = T)
+scen_pypsa_base_gams <- read(scen_pypsa_base_gams)
+summary(scen_pypsa_base_gams)
+fname <- file.path(p$scen$BASE$root, glue("{p$scen_name}.RData"))
+print(paste("Savinn:", fname, "\n"))
+save(scen_pypsa_base_gams, file = fname)
+
+# scen_PyPSA_Pyomo <- 
+#   write(scen_PyPSA, solver = Pyomo, 
+#         tmp.dir = file.path(p$dir$scen, "PyPSA", "Pyomo"))
+# scen_PyPSA_Pyomo@misc$tmp.dir
+# solve(scen_PyPSA_Pyomo, wait = F)
+
+# scen_PyPSA_GAMS <- read(scen_PyPSA_GAMS)
+# summary(scen_PyPSA_GAMS)
+# save(scen_PyPSA_GAMS, file = file.path(p$dir$scen, "scen_PyPSA_GAMS.RData"))
+
+# scen <- scen_pypsa_base_gams
+# getData(scen, "vTechCap", merge = T, digits = 3) |> as.data.table()
+# getData(scen, c("vTechNewCap", "vStorageNewCap"), merge = T, 
+#         digits = 2, drop.zeros = T, process = T) |> as.data.table()
+```

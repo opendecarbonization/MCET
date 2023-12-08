@@ -1,0 +1,386 @@
+fp <- file.path
+
+mcet_check_installations <- function(stop_if_not = TRUE, autoinstall = FALSE) {
+  status <- TRUE
+  # check if all required packages are installed
+  if (packageVersion("energyRt") < "0.11.1") {
+    msg <- paste0(
+      "Please update energyRt to version 0.11.1 or higher",
+      "\n       ",
+      "devtools::install_github('energyRt/energyRt', ref = 'dev')"
+    )
+    if (stop_if_not) {
+      stop(msg)
+    } else {
+      message(msg)
+      status <- FALSE
+    }
+  }
+
+  # and install them if not
+  if (!requireNamespace("devtools", quietly = TRUE)) {
+    stop("Please install devtools", "\n       ",
+         "install.packages('devtools')")
+  }
+
+  return(status)
+}
+
+# =============================================================================#
+#### MERRA data ####
+
+rev_merra_cl_filemask <-
+  function(tol, wind = T, solar = !wind, dir = NULL, year = NULL) {
+    # browser()WH
+    # filemask <- glue("TOL", prettyNum(tol)) %>% str_replace_all("\\.", "")
+    stopifnot(tol <= 1 & tol >= 0)
+    if (tol == 1) return(paste0("TOL", 99))
+    if (tol < .01) FORMAT = "f" else FORMAT = "d"
+    # filemask <- glue("TOL", prettyNum(tol)) %>% str_replace_all("\\.", "")
+    filemask <- glue("TOL", formatC(tol * 100, width = 2, flag = "0",
+                                    format = FORMAT))
+    # if ()
+    # if (!is.null(year))
+    # if (!is.null(dir))
+    filemask
+  }
+if (F) {
+  rev_merra_cl_filemask(.01)
+  rev_merra_cl_filemask(.1)
+  rev_merra_cl_filemask(1)
+  rev_merra_cl_filemask(.0001) # reserved but not expected to be used
+  rev_merra_cl_filemask(1e-10) # reserved but not expected to be used
+  rev_merra_cl_filemask(1.1)
+
+}
+
+
+make_tech_name <- function(tech, cluster = NULL, cl_sfx = "", na.cluster = "") {
+  # (status: interim solution)
+  # goal: make names for technologies with clusters
+  # `00` indicates "no" or "only one" cluster
+  # `na` - NA replacement
+  # browser()
+  # cluster[is.na(cluster)] <- na
+  # ii <- is.na(tech)
+  if (!is.null(cluster) && length(unique(cluster[!is.na(cluster)])) > 1) {
+    # nnum - number of digital places to indicate clusters, default = 2
+    if (max(cluster, na.rm = T) > 99) nnum <- nchar(max(cluster, na.rm = T)) else nnum <- 2
+    cl_sfx <- formatC(cluster, digits = 0, width = nnum, flag = "0")
+    cl_sfx[grepl("NA$", cl_sfx)] <- na.cluster
+  }
+  tech_cl <- paste0(tech, cl_sfx)
+  tech_cl[is.na(tech)] <- NA
+  return(tech_cl)
+}
+
+if (F) {
+  make_tech_name(rep("ESOL", 3), 1:3)
+  make_tech_name(rep("ESOL", 3), rep(1, 3)) # `00` - no/one cluster
+  make_tech_name(rep("ESOL", 3), c(1, NA, 1))
+  make_tech_name(rep("ESOL", 3), c(1, NA, 1), na.cluster = "00")
+  make_tech_name(c("ESOL", NA, "ESOL"), c(1, NA, 1))
+  make_tech_name(rep("ESOL", 3), c(1, NA, 1), na = "")
+}
+
+
+# =============================================================================#
+# Various function to use in the project
+# =============================================================================#
+
+#' Extract, snap_to_grid, and union polygons
+#'
+#' @description
+#' A workaround to improve stability of `st_union` on geometry objects (`sfc`)
+#' to use in aggregation of geometries. The function selects only `polygons`
+#' type of geometries from `GEOMETRYCOLLECTION`, simplifies ("snaps to grid")
+#' and returns aggregated polygon object.
+#'
+#' @param x geometry object in lon/lat coordinates
+#' @param grid_size see `s2::s2_snap_to_grid` for details
+#'
+#' @return
+#' @export
+#'
+#' @examples
+rev_union_polygons <- function(x, grid_size = 1e-5) {
+  # workaround to improve stability of aggregation of geometries
+  # x - geometry
+  # browser()
+  ii <- sapply(x, function(g) {
+    inherits(g, c("sfc_GEOMETRYCOLLECTION", "GEOMETRYCOLLECTION"))
+  })
+  if (any(ii)) {
+    x <- try({
+      suppressWarnings(
+        sf::st_collection_extract(x, "POLYGON", warn = F)
+      )
+    }, silent = T)
+    if (inherits(x, "try-error")) x <- sf::st_polygon(list())
+  }
+
+  x %>%
+    s2::s2_snap_to_grid(grid_size) %>%
+    sf::st_as_sf() %>%
+    sf::st_make_valid() %>%
+    sf::st_union() %>%
+    sf::st_make_valid()
+}
+
+#' Suggest values for labeling integer axes
+#'
+#' @param n integer giving the desired number of intervals
+#' @param ... further arguments for `base::pretty`
+#'
+#' @return
+#' @export
+#'
+#' @examples
+rev_integer_breaks <- function(n = 5, must_have = NULL, ...) {
+  n_default <- n
+  function(x, n = n_default) {
+    breaks <- pretty(x, n, ...)
+    # if (!is.null(must_have)) breaks <- c(must_have, breaks)
+    breaks <- as.integer(c(must_have, breaks)) %>% unique() %>% sort()
+    names(breaks) <- attr(breaks, "labels")
+    breaks
+  }
+}
+
+## Translation functions ####
+#' Translate names of `buses` in `PyPSA` to `regions` in `energyRt`
+#' @description
+#' `energyRt` is using names conversion suitable for several modeling languages
+#' (R, GAMS, Python, Julia, GLPK/MathProg), therefore names in sets (such as `regions`)
+#' cannot include white-spaces or any special characters. This function provides
+#' a set of rules to map (or rename) `buses` to universal format, using
+#' capital letters (not required) and
+#' This is an ad-hoc function for a particular model(s) and project(s).
+#' Adjustments might be required in the case of changes in the model(s).#'
+#' @param x
+#' @param num_width
+#' @param sep
+#' @param mod
+#'
+#' @return
+#' @export
+#'
+#' @examples
+rev_bus2reg <- function(x, num_width = 2, sep = "", mod = "mod_toy") {
+  # browser()
+  if (grepl("toy", mod)) { # toy model
+    NN <- str_extract(x, "[0-9]+$")
+    TXT <- str_replace(x, NN, "") %>% str_trim() %>% toupper()
+    if (any(grepl("[0-9]", TXT)))
+      stop("Unrecognized (non-ending or multiple) numeric indexes in names")
+    NN <- formatC(as.integer(NN), width = num_width, flag = "0", format = "d")
+    return(paste(TXT, NN, sep = sep))
+  } else if (grepl("adm", mod)) { # administrative regions
+    # stop("Not implemented yet for other than `mod_toy` cases")
+    rg_mp <- read_fst(fp(p$dir$data_mod, "reg_nodes.fst")) %>%
+      select(bus:load_zones)
+    d <- data.table(bus = x) %>% left_join(rg_mp, by = "bus")
+    return(d$region)
+  }
+}
+
+rev_reg2bus <- function(x, map = NULL) {
+  # str_replace_all(x, " |-", sep)
+}
+
+#' Replace special characters in names
+#'
+#'@description a wrapper for `str_replace_all` replaceing all special characters by default.
+#' @param x character vector with names potentially have characters to replace.
+#' @param pattern pattern to replace, default `"[^[:alnum:]]"`
+#' @param replacement a character to replace, `"_"` by default.
+#'
+#' @return character vector with applied replacements.
+#' @export
+#'
+#' @examples
+rev_repare_names <- function(x, pattern = "[^[:alnum:]]", replacement = "_") {
+  str_replace_all(x, pattern, replacement)
+}
+
+#' Translate names of `carriers` in `PyPSA` to `commodities` in `energyRt`
+#'
+#' @description
+#' `energyRt` is using names conversion suitable for several modeling languages
+#' (R, GAMS, Python, Julia, GLPK/MathProg), therefore names in sets (such as commodities)
+#' cannot include white-spaces or any special characters. This function provides
+#' a set of rules to map (or rename) `carriers` to universal format, using
+#' capital letters (not required) and
+#' This is an ad-hoc function for a particular model(s) and project(s).
+#' Adjustments might be required in the case of changes in the model(s).
+#'
+#' @param x string vector with `carriers` names
+#'
+#' @return string vector with `commodity` names to use in `energyRt``
+#' @export
+#'
+#' @examples
+carriers2comm <- function(x) {
+  # mapping carriers to commodities
+  x <- toupper(x)
+  x[grepl("COA", x, ignore.case = TRUE)] <- "COA"
+  x[grepl("OIL", x, ignore.case = TRUE)] <- "OIL"
+  x[grepl("CGT", x, ignore.case = TRUE)] <- "GAS"
+  x[grepl("WIND", x, ignore.case = TRUE)] <- "WIN"
+  x[grepl("SOLAR", x, ignore.case = TRUE)] <- "SOL"
+  x[grepl("LIGN", x, ignore.case = TRUE)] <- "LIG"
+  x[grepl("BIO", x, ignore.case = TRUE)] <- "BIO"
+  x[grepl("NUC", x, ignore.case = TRUE)] <- "NUC"
+  x[grepl("GEO", x, ignore.case = TRUE)] <- "GEO"
+  x[grepl("ROR", x, ignore.case = TRUE)] <- "ROR"
+  x[grepl("PHS", x, ignore.case = TRUE)] <- "PHS"
+  x[grepl("HYDRO", x, ignore.case = TRUE)] <- "HYD"
+  x[grepl("BATTERY", x, ignore.case = TRUE)] <- "BTR" # or CHARGE (energy stored chemically for conversion into electricity)
+  x[grepl("^H2$", x, ignore.case = TRUE)] <- "H2"
+  x <- toupper(x)
+  x <- str_trim(x)
+  x
+}
+
+rev_extract_bus <- function(x, bus_names = reg_names$bus, check_length = TRUE) {
+  # browser()
+  pat <- paste0(bus_names, collapse = "|")
+  bus <- str_extract(x, pat)
+  if (check_length) stopifnot(length(bus) == length(x))
+  bus
+}
+
+#### YAML & settings ####
+#' Set country name to use in `rev_*` functions in the current project
+#'
+#' @param iso3c (character) country `ISO alpha-3` code
+#'
+#' @return R option `rev.iso3c` is set to the given value.
+#' @export
+#'
+#' @examples
+rev_set_country <- function(iso3c = params$iso3c, verbose = TRUE) {
+  stopifnot(is.character(iso3c))
+  stopifnot(length(iso3c) == 1)
+  cn <- countrycode::countrycode(iso3c, "iso3c", "country.name", warn = F)
+  if (is.na(cn)) stop("Unrecognized 'iso3c' code '", iso3c,
+                      "'. See `?countrycode::countrycode` for details.")
+  options(rev.iso3c = iso3c)
+  # if (verbose) cat("Option 'rev.iso3c' set to '", iso3c, "'.", sep = "")
+  if (verbose) cat("Country code set to '", iso3c, "' (", cn, ")", sep = "")
+  return(invisible(TRUE))
+}
+
+if (F) {
+  rev_set_country("CHN")
+  rev_country()
+  rev_set_country("BGD")
+  rev_country()
+  rev_set_country("BG")
+  rev_country()
+}
+
+#' Read `rev.iso3c` option
+#'
+#' @description a wrapper for `options` function to read (preset) isocode of the current country.
+#' @return (character)
+#' @export
+#'
+#' @examples
+rev_country <- function() {
+  options()$rev.iso3c
+}
+
+
+#' Read the project yaml file
+#'
+#' @param iso3c country isocode alpha-2
+#' @param path path to directory to save the configuration file
+#' @param filename name of the file (default config_`iso3c`.yml)
+#' @param raw logical, should the read yaml file be return without pre-processing (this includes merging paths for known directories of the project), FALSE by default.
+#' @param projdir full path of the project; will be used as default path for not-provided path.
+#'
+#' @return list with yaml parameters
+#' @export
+#'
+#' @examples
+rev_read_yaml <- function(iso3c = NULL, path = NULL,
+                          filename = paste0("config_", iso3c, ".yml"),
+                          projdir = getwd(),
+                          raw = FALSE) {
+  # browser()
+  if (is.null(iso3c)) iso3c <- rev_country()
+  if (is.null(iso3c)) stop("Country code ", iso3c, " was not found.")
+  if (!is.null(path)) {
+    FILE <- file.path(path, filename)
+  } else {
+    FILE <- filename
+  }
+  p <- yaml::read_yaml(FILE)
+  if (raw) {
+    return(p)
+  }
+
+  p$dir <- lapply(p$dir, function(x) {unlist(x) %>% paste(collapse = "/")})
+  p$files <- lapply(p$files, function(x) {unlist(x) %>% paste(collapse = "/")})
+
+  rev_make_project_dirs(p)
+  p
+}
+
+if (F) {
+  p <- rev_read_yaml(paste0("config_COL.yml"))
+  p
+}
+
+#' Create directories for the project
+#'
+#' @param prm list list with the projects' parameters (from yaml)
+#'
+#' @return checked/created directories
+#' @export
+#'
+#' @examples
+rev_make_project_dirs <- function(prm) {
+  for (i in 1:length(prm$dir)) {
+    if (!dir.exists(prm$dir[[i]])) {
+      message("Creating directory: ", prm$dir[[i]])
+      dir.create(prm$dir[[i]], recursive = T, showWarnings = T)
+    } else {
+      cat('"', prm$dir[[i]], '"\n', sep = "")
+    }
+  }
+}
+
+#### Figures / reporting ####
+#' ggplot2 theme used in the project for maps
+#'
+#' @return ggplot theme object
+#' @export
+#'
+#' @examples
+rev_theme_map <- function() {
+  ggplot2::theme_bw() +
+    ggplot2::theme(
+      plot.title = element_text(hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5))
+}
+
+rev_theme_map2 <- function() {
+  # ggplot2::theme_bw() +
+  ggthemes::theme_map() +
+    ggplot2::theme(
+      plot.title = element_text(hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5))
+}
+
+
+rev_theme_void <- function() {
+  ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.title = element_text(hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5))
+}
+
+
+
