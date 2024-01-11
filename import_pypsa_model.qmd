@@ -4,22 +4,22 @@ subtitle: "build Switch and energyRt models, update PyPSA-Earth input"
 author: "Multi-Country Electricity Transition Potential and Challenges"
 date:  "`r Sys.Date()`"
 format: 
-  html:
-    code-fold: true
-    fig-width: 8
-    fig-height: 6
-    toc: true
+  # html:
+  #   code-fold: true
+  #   fig-width: 8
+  #   fig-height: 6
+  #   toc: true
   pdf:
     fig-width: 7
     fig-height: 5  
     toc: true
 execute:
-  echo: true # should the code be echoed in the output document?
+  echo: false # should the code be echoed in the output document?
   eval: true # should the code be evaluated? (doesn't override chunk settings)
   error: false # Include errors in the output (false == stop on error)
   # warning: false # Include warnings in the output
   # message: false # Include messages in the output
-  
+
 # Model parameters
 params: 
   iso3c: BGD # country code
@@ -60,6 +60,8 @@ params:
   # YAML file parameters can be overwritten here
   # fig_map_width: 6
   # ...
+editor_options: 
+  chunk_output_type: console
 ---
 
 # `r countrycode::countrycode(params$iso3c, "iso3c", "country.name")` model
@@ -2357,7 +2359,7 @@ cat("switch_model.generators.extensions.storage", "\n", file = fl, append = TRUE
 ```{r}
 #| eval: !expr params$build_switch
 fl <- file.path(p$scen$BASE$switch, "inputs/switch_inputs_version.txt")
-cat("2.0.7", "\n", file = fl, append = TRUE)
+cat("2.0.7", "\n", file = fl, append = FALSE)
 ```
 
 ### switch: solve
@@ -2443,46 +2445,30 @@ repo <- newRepository("base") |>
     DEMELC # load curve
   )
 
-# tst <- list(
-#   ANNUAL = "ANNUAL",
-#   YDAY = 
-# )
-# 
-# mod <- newModel(
-#   name = p$scen_name, 
-#   # desc = "Reproduced PyPSA model with MERRA2 cf in energyRt",
-#   ## in case of infeasibility, `dummy` variables can be added
-#   # debug = data.frame(#comm = "ELC",
-#   #                    dummyImport = 1e6,
-#   #                    dummyExport = 1e6),
-#   region = reg_names$region,
-#   discount = p$discount,
-#   slice = rev_data$timescales$energyRt_levels,
-#   repository = repo
-# )
+timetable_d365_h24 <- make_timetable(
+  struct = list(
+    ANNUAL = "ANNUAL",
+    YDAY = str_extract(timedim$slice, "d[0-9]+") |> unique(),
+    HOUR = str_extract(timedim$slice, "h[0-9]+") |> unique()
+  )
+)
+
+calendar_d365_h24 <- newCalendar(timetable_d365_h24, name = "calendar_d365_h24")
 
 
+mod <- newModel(
+  name = p$scen$BASE$name,
+  desc = "Reproduced PyPSA model with MERRA2 cf in energyRt",
+  region = reg_names$region,
+  discount = p$discount,
+  calendar = calendar_d365_h24,
+  repository = repo
+)
 
-# mod <- setTimeSlices(mod, slice = rev_data$timescales$energyRt_levels)
-# mod@misc$gis <- gis
-# mod@misc$plots <- list(
-#   adm1_map = adm1_map,
-#   voronoi_map = voronoi_map
-# )
+mod <- setHorizon(mod, p$base_year, 1)
+mod@config@horizon
 
-# mod <- setMilestoneYears(mod, start = p$base_year, interval = 1)
-# mod@sysInfo@milestone # check
-# mod_path <- file.path(p$scen$BASE$root, "PyPSA_base_merra")
-# mod_path <- p$scen$BASE$root
-# dir.create(p$scen$BASE$root, showWarnings = F, recursive = T)
-# save(mod, #network, voronoi_map, reg_nodes,
-#      file = file.path(p$scen$BASE$root, "energyRt_model.RData"))
-
-# save repositories
-# ls(pattern = "repo_") # repositories
-# save(list = ls(pattern = "repo_"), 
-#      file = file.path(p$scen$BASE$root, "energyRt_repo.RData"))
-
+save(mod, file = file.path(p$scen$BASE$energyRt, "energyRt_model.RData"))
 ```
 
 ### energyRt: solve
@@ -2491,23 +2477,27 @@ repo <- newRepository("base") |>
 #| eval: !expr params$solve_energyRt
 #| include: false
 
-# scen <- interpolate(mod, name = "PyPSA", trim = F)
-# save(mod, file = file.path(p$scen$BASE$root, "energyRt_model.RData"))
-scen_pypsa_base <- interpolate(mod, name = p$scen_name, trim = F)
+scen_pypsa_base <- interpolate(
+  mod, 
+  name = p$scen$BASE$name,
+  path = p$scen$BASE$energyRt
+)
 
-# try(source("tmp/gams_config.R"))
-source("tmp/solver_options.R")
-scen_pypsa_base_gams <- write(scen_pypsa_base, 
-                              solver = GAMS_parallel,
-                              # solver = GAMS_mac,
-                              tmp.dir = file.path(p$scen$BASE$root, "GAMS"))
+try(source("tmp/gams_config.R"))
+# source("tmp/solver_options.R")
+scen_pypsa_base_gams <- write_script(
+  scen_pypsa_base, 
+  solver = GAMS_barrier
+  # solver = GAMS_mac,
+  # tmp.dir = file.path(p$scen$BASE$root, "GAMS")
+  )
 
 scen_pypsa_base_gams@misc$tmp.dir 
 
-solve(scen_pypsa_base_gams, wait = T)
+solve(scen_pypsa_base_gams, wait = F)
 scen_pypsa_base_gams <- read(scen_pypsa_base_gams)
 summary(scen_pypsa_base_gams)
-fname <- file.path(p$scen$BASE$root, glue("{p$scen_name}.RData"))
+fname <- file.path(p$scen$BASE$root, glue("{p$scen$BASE$name}.RData"))
 print(paste("Savinn:", fname, "\n"))
 save(scen_pypsa_base_gams, file = fname)
 
