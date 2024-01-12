@@ -23,6 +23,7 @@ execute:
 # Model parameters
 params: 
   iso3c: BGD # country code
+  # iso3c: IND # country code
   
   # Model choice, defined by selection of a the YAML file
   yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
@@ -33,7 +34,7 @@ params:
   save_raw_csv: false # save imported PyPSA-Earth data as csv files
   build_switch: true # write/overwrite Switch model input files
   solve_switch: false # solve Switch model
-  build_energyRt: false # write/overwrite energyRt model input files
+  build_energyRt: true # write/overwrite energyRt model input files
   solve_energyRt: false # solve energyRt model
 
   force: true # try to auto-resolve some declaration errors in data?
@@ -75,6 +76,29 @@ editor_options:
 
 \newpage
 
+
+```{r, eval=FALSE}
+#| eval: false
+## To execute this file:
+# adjust parameters (in YAML header) and run this command, 
+# specifying country and the model
+# ?quarto::quarto_render # for help
+quarto::quarto_render(
+  input = "import_pypsa_model.qmd",
+  # output_file = "import_pypsa_model_BGD.pdf",
+  output_file = "import_pypsa_model_IND.pdf",
+  # output_file = "import_pypsa_model_THA.pdf",
+  execute_params = list(
+    # iso3c = "BGD", 
+    iso3c = "IND",
+    # iso3c = "THA", 
+    yaml_path = "config/mod_toy"
+    )
+  )
+# in the case of errors, run the file chunk-by-chunk
+```
+
+
 ## Setup
 
 Load required libraries, set country by `iso3c` code for the evaluation, read yaml file, and load maps.
@@ -112,6 +136,7 @@ for (i in 1:length(params)) {p[[names(params)[i]]] <- params[[i]]}
 
 if (p$use_tech_database) (load("data/repo_pypsa_techs.RData"))
 
+# print(p)
 ```
 
 ## Import PyPSA-Earth dataset
@@ -1020,8 +1045,10 @@ ror <- nc$generators_cf |>
   filter(grepl(" ror$", generators_t_p_max_pu_i)) |>
   mutate( # !!! ToDo: write functions !!!
     # bus = str_extract(generators_t_p_max_pu_i, "[A-Z]+.[0-9]+"),
-    bus = str_extract(generators_t_p_max_pu_i, " ror$"),
-    tech_pypsa = str_trim(str_replace(generators_t_p_max_pu_i, bus, "")),
+    bus = rev_extract_bus(generators_t_p_max_pu_i),
+    # tech_pypsa = str_replace(generators_t_p_max_pu_i, " ror$", ""),
+    # tech_pypsa = str_trim(str_replace(generators_t_p_max_pu_i, bus, "")),
+    tech_pypsa = "ror",
     tech = "EROR", # assuming one technology per region
     weather = "WROR") |>
   left_join(reg_names, by = "bus") |>
@@ -1651,7 +1678,7 @@ if (nrow(phs) > 0) {
     stg <- newStorage(
       name = s,
       # desc = paste(x$stores_i, collapse = ", "),
-      commodity = list(comm = unique(x$comm)),
+      commodity = unique(x$comm),
       cap2stg = mean(x$storage_units_max_hours),
       region = unique(x$region),
       seff = list(
@@ -1964,7 +1991,9 @@ links <- nc$links |>
     output = if_else(output == "", "ELC", output)
     # tech_name = paste0("STG_", toupper(stores))
   ) |>
-  left_join(reg_names, by = "bus")
+  left_join(reg_names, by = "bus") |>
+  unique()
+
 ```
 
 ### energyRt: technologies ("links" in PyPSA)
@@ -2025,6 +2054,7 @@ acc_links <- links |>
     process = if_else(grepl("cell|discharger", links_carrier), "out", "inp")
   ) |>
   select(-(links_i:links_carrier), -(bus:output), -load_zones) |>
+  unique() |>
   pivot_wider(
     names_from = c(process), 
     values_from = c(links_p_nom_extendable:links_capital_cost)) |>
@@ -2360,6 +2390,16 @@ cat("switch_model.generators.extensions.storage", "\n", file = fl, append = TRUE
 #| eval: !expr params$build_switch
 fl <- file.path(p$scen$BASE$switch, "inputs/switch_inputs_version.txt")
 cat("2.0.7", "\n", file = fl, append = FALSE)
+
+fl <- file.path(p$scen$BASE$switch, "options.txt")
+cat("--verbose", "\n", file = fl, append = FALSE)
+cat("--stream-solver", "\n", file = fl, append = TRUE)
+cat("--inputs-dir inputs", "\n", file = fl, append = TRUE)
+cat("--no-save-solution", "\n", file = fl, append = TRUE)
+cat("--solver cplex", "\n", file = fl, append = TRUE)
+cat("--solver-options-string 'lpmethod=4 solutiontype=2'", "\n", file = fl,
+    append = TRUE)
+rm(fl)
 ```
 
 ### switch: solve
@@ -2379,7 +2419,7 @@ cat("cmd /k", "\n", file = fl, append = TRUE)
 print("switch: solve")
 # plan(multisession(workers = 2))
 # switch_eval <- future({
-system(fl, wait = F, invisible = F)
+# system(fl, wait = F, invisible = F)
 # print("switch solve started")
 # })
     
@@ -2473,9 +2513,11 @@ save(mod, file = file.path(p$scen$BASE$energyRt, "energyRt_model.RData"))
 
 ### energyRt: solve
 
-```{r}
-#| eval: !expr params$solve_energyRt
+```{r, eval=FALSE}
+#| eval: false
 #| include: false
+# eval: !expr params$solve_energyRt
+
 
 scen_pypsa_base <- interpolate(
   mod, 
@@ -2492,14 +2534,14 @@ scen_pypsa_base_gams <- write_script(
   # tmp.dir = file.path(p$scen$BASE$root, "GAMS")
   )
 
-scen_pypsa_base_gams@misc$tmp.dir 
+# scen_pypsa_base_gams@misc$tmp.dir 
 
-solve(scen_pypsa_base_gams, wait = F)
-scen_pypsa_base_gams <- read(scen_pypsa_base_gams)
-summary(scen_pypsa_base_gams)
-fname <- file.path(p$scen$BASE$root, glue("{p$scen$BASE$name}.RData"))
-print(paste("Savinn:", fname, "\n"))
-save(scen_pypsa_base_gams, file = fname)
+# solve(scen_pypsa_base_gams, wait = F)
+# scen_pypsa_base_gams <- read(scen_pypsa_base_gams)
+# summary(scen_pypsa_base_gams)
+# fname <- file.path(p$scen$BASE$root, glue("{p$scen$BASE$name}.RData"))
+# print(paste("Savinn:", fname, "\n"))
+# save(scen_pypsa_base_gams, file = fname)
 
 # scen_PyPSA_Pyomo <- 
 #   write(scen_PyPSA, solver = Pyomo, 

@@ -244,8 +244,8 @@ carriers2comm <- function(x) {
 
 rev_extract_bus <- function(x, bus_names = reg_names$bus, check_length = TRUE) {
   # browser()
-  pat <- paste0(bus_names, collapse = "|")
-  bus <- str_extract(x, pat)
+  # pat <- paste0(bus_names, collapse = "|")
+  bus <- str_extract(x, "[A-Z]++( |)[0-9]++")
   if (check_length) stopifnot(length(bus) == length(x))
   bus
 }
