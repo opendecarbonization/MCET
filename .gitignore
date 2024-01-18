@@ -71,3 +71,11 @@ data/*/mod_adm/
 */VNM/*
 */KAZ/*
 config/mod_adm
+
+# macOS metadata
+.DS_Store
+Icon?
+
+# Python bytecode
+__pycache__
+*.pyc

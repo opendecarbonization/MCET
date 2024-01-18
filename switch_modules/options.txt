@@ -1,0 +1,4 @@
+--inputs-dir 3zone_toy_inputs
+--verbose
+--stream-solver
+--suffix dual  # needed for cplex & gurobi solvers w/ Switch 2.0.7

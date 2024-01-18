@@ -1,0 +1,4 @@
+ZONES,PERIOD,standard_load_addition,daily_shiftable_load_addition,annual_shiftable_load_addition,annual_shiftable_load_min_cf
+North,2030,-0.25,0.25,0.1,0.35
+Central,2030,-0.25,0.25,0.1,0.35
+South,2030,-0.25,0.25,0.1,0.35

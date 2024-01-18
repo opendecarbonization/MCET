@@ -1,0 +1,4 @@
+--scenario-name flex_all_zones --outputs-dir outputs_flex_all_zones --include-modules mcet_modules.dates mcet_modules.flexible_loads
+--scenario-name flex_by_zone --outputs-dir outputs_flex_by_zone --include-modules mcet_modules.dates mcet_modules.flexible_loads --input-alias flexible_loads.csv=flexible_loads_by_zone.csv
+--scenario-name hydrogen --outputs-dir outputs_hydrogen --include-modules mcet_modules.dates mcet_modules.hydrogen
+--scenario-name trans_limit --outputs-dir outputs_trans_limit_25 --include-module mcet_modules.new_transmission_limit
