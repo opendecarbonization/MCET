@@ -79,3 +79,7 @@ Icon?
 # Python bytecode
 __pycache__
 *.pyc
+
+# Switch model results and logs
+switch_modules/out*
+switch_modules/*.log
