@@ -1,0 +1,7 @@
+--verbose
+--stream-solver
+--no-save-solution
+
+# cplex barrier no crossover:
+--solver cplex
+--solver-options-string "lpmethod=4 solutiontype=2"
