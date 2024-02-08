@@ -1,4 +1,5 @@
 --inputs-dir 3zone_toy_inputs
 --verbose
 --stream-solver
+--no-save-solution  # don't save binary .pickle file with full solution
 --suffix dual  # needed for cplex & gurobi solvers w/ Switch 2.0.7
