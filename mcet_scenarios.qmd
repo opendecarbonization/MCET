@@ -19,15 +19,17 @@ execute:
   # warning: false # Include warnings in the output
   # message: false # Include messages in the output
 params: 
-  
   # Model choice, defined by selection of a the YAML file
-  
-  
   # Build and/or solve scenarios (complements)
   # iso3c: BGD # country code
-  # iso3c: IND # country code
+  # iso3c: CHL
+  # iso3c: CHN
+  # iso3c: COL
+  # iso3c: IND 
   # iso3c: KAZ
-  iso3c: THA
+  iso3c: MYS
+  # iso3c: THA
+  # iso3c: VNM
   yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
   mod_dirname: "scen_pypsa_2050_TOL99" # model (directory) name
   # add_ccs: false # add ECCG_CCS and ECOA_CCS technologies if not available
@@ -55,6 +57,28 @@ editor_options:
 
 This document takes pre-built (Switch or energyRt) model and creates set of MCET scenarios to solve. Several scenarios require changes in the set of technologies and/or additional constraints. While the structure of the model, shapes of regions (load zones), efficiency parameters and costs of technologies are not affected by the scenarios.
 
+```{r, eval=FALSE}
+#| eval: false
+## To execute this file:
+# adjust parameters (in YAML header), save, and run this command, 
+# specifying country and the model
+# ?quarto::quarto_render # for help
+quarto::quarto_render(
+  input = "mcet_scenarios.qmd",
+  # output_file = "mcet_scenarios_KAZ.pdf",
+  output_file = "mcet_scenarios_MYS.pdf",
+  execute_params = list(
+    # iso3c = "BGD", 
+    # iso3c = "IND",
+    # iso3c = "THA",
+    # iso3c = "KAZ",
+    iso3c = "MYS",
+    yaml_path = "config/mod_toy"
+    )
+  )
+# in the case of errors, run the file chunk-by-chunk
+```
+
 
 ```{r setup}
 #| warning: false
@@ -80,7 +104,12 @@ fp <- here
 # Set country
 rev_set_country(params$iso3c)
 rev_country()
-
+message(c(
+  rep("=", 70), "\n",
+  "Solving scenarios for ", rev_country(), "\n",
+  rep("=", 70)
+))
+Sys.sleep(7)
 # read configuration file for the country
 p <- rev_read_yaml(path = params$yaml_path, iso3c = params$iso3c)
 
@@ -168,6 +197,7 @@ Solving the model without carbon constraint.
 ```{r eval= params$solve_switch}
 scen_name <- "No_policy"
 if (params$solve_switch & params$No_policy) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
   
   # change working directory
   os <- import("os")
@@ -258,6 +288,7 @@ rm(scen_name)
 ```{r eval= params$solve_switch}
 scen_name <- "Reference"
 if (params$solve_switch) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
   
   # change working directory
   os <- import("os")
@@ -362,6 +393,7 @@ rm(scen_name)
 ```{r eval=params$solve_switch}
 scen_name <- "RES_storage_H2"
 if (params$solve_switch & params$RES_storage_H2) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
   # change working directory
   # os <- import("os")
   os$getcwd()
@@ -429,6 +461,7 @@ rm(scen_name)
 ```{r eval=params$solve_switch}
 scen_name <- "RES_storage"
 if (params$solve_switch & params$RES_storage) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
   # change working directory
   # os <- import("os")
   os$getcwd()
@@ -498,7 +531,8 @@ No Tx expansion allowed in the reference
 for (i in c(75, 50, 25, 0)) {
   scen_name <- glue("Tx_{i}")
   if (params$solve_switch & p[[scen_name]]) { 
-    message("Solving '", scen_name, "'")
+    # message("Solving '", scen_name, "'")
+    message("Solving '", scen_name, "', ", p$country, ", ", p$model)
     # stop()
     # change working directory
     os$chdir(p$dir$switch)
@@ -552,6 +586,7 @@ rm(flexible_loads_by_zone_i)
 ```{r eval=params$solve_switch}
 scen_name <- "DR_1"
 if (params$solve_switch & p[[scen_name]]) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
   fwrite(flexible_loads, fp(p$dir$switch, "inputs", "flexible_loads.csv"))
   # change working directory
   # os <- import("os")
@@ -587,6 +622,8 @@ rm(scen_name)
 ```{r eval=params$solve_switch}
 scen_name <- "DR_2"
 if (params$solve_switch & p[[scen_name]]) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
+
   fwrite(flexible_loads_by_zone, 
          fp(p$dir$switch, "inputs", "flexible_loads.csv"))
   # change working directory
@@ -623,6 +660,8 @@ rm(scen_name)
 ```{r eval=params$solve_switch}
 scen_name <- "DR_3"
 if (params$solve_switch & p[[scen_name]]) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
+  
   fwrite(flexible_loads, 
          fp(p$dir$switch, "inputs-RES_storage", "flexible_loads.csv"))
   # change working directory
@@ -659,6 +698,8 @@ rm(scen_name)
 ```{r eval=params$solve_switch}
 scen_name <- "DR_4"
 if (params$solve_switch & p[[scen_name]]) { 
+  message("Solving '", scen_name, "', ", p$country, ", ", p$model)
+  
   fwrite(flexible_loads_by_zone, 
          fp(p$dir$switch, "inputs-RES_storage", "flexible_loads.csv"))
   # change working directory

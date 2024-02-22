@@ -54,6 +54,7 @@ data/*/gadm/
 data/*/gwa/
 data/*/nrel/
 data/*/mod_adm/
+
 */*/*IND*
 */*/*CHN*
 */*/*CHL*
@@ -61,25 +62,45 @@ data/*/mod_adm/
 */*/*MYS*
 */*/*THA*
 */*/*VNM*
-*/*/*KAZ*
-*/IND/*
-*/CHN/*
-*/CHL/*
-*/COL/*
+#*/*/*KAZ*
+
+#*/IND/*
+#*/CHN/*
+#*/CHL/*
+#*/COL/*
 */MYS/*
-*/THA/*
-*/VNM/*
-*/KAZ/*
+#*/THA/*
+#*/VNM/*
+#*/KAZ/*
 config/mod_adm
+config/mod_custom
+data/*/mod_adm
+data/*/mod_custom
 
-# macOS metadata
-.DS_Store
-Icon?
+data/*/gis*
+last_config.RData
+*.pdf
+*.html
+figures/*
+*.Rmd
+_scenarios/
 
-# Python bytecode
-__pycache__
-*.pyc
+*TOL00*
+*TOL01*
+*TOL02*
+*TOL03*
+*TOL05*
+*TOL20*
+*2019*
+*last_config*
+data/rev_data*
 
-# Switch model results and logs
-switch_modules/out*
-switch_modules/*.log
+# For large files, install: https://git-lfs.com/
+# git lfs install
+# git lfs track "*.fst"
+# git lfs track "*.RData"
+# git add .gitattributes
+
+#
+# git reset HEAD~1 # reset not-pushed commit
+# git revert HEAD # revert pushed commit

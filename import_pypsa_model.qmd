@@ -21,13 +21,16 @@ execute:
   # message: false # Include messages in the output
 
 # Model parameters
-params: 
+params:
   # iso3c: BGD # country code
-  # iso3c: IND # country code
+  # iso3c: CHL
+  # iso3c: CHN
+  # iso3c: COL
+  # iso3c: IND 
   # iso3c: KAZ
+  iso3c: MYS
   # iso3c: THA
-  iso3c: CHN
-  
+  # iso3c: VNM
   # Model choice, defined by selection of a the YAML file
   yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
   # yaml_path: "config/mod_adm" # file: "{yaml_path}/config_{iso3c}.yml
@@ -102,12 +105,14 @@ quarto::quarto_render(
   # output_file = "import_pypsa_model_BGD.pdf",
   # output_file = "import_pypsa_model_IND.pdf",
   # output_file = "import_pypsa_model_THA.pdf",
-  output_file = "import_pypsa_model_KAZ.pdf",
+  # output_file = "import_pypsa_model_KAZ.pdf",
+  output_file = "import_pypsa_model_MYS.pdf",
   execute_params = list(
     # iso3c = "BGD", 
     # iso3c = "IND",
     # iso3c = "THA",
-    iso3c = "KAZ",
+    # iso3c = "KAZ",
+    iso3c = "MYS",
     yaml_path = "config/mod_toy"
     )
   )
@@ -140,6 +145,13 @@ library(energyRt)
 # Set country
 rev_set_country(params$iso3c)
 rev_country()
+
+message(c(
+  rep("=", 70), "\n",
+  "Importing PyPSA-Earth dataset for ", rev_country(), "\n",
+  rep("=", 70)
+))
+Sys.sleep(7)
 
 # read configuration file for the country
 p <- rev_read_yaml(path = params$yaml_path, iso3c = params$iso3c)
@@ -2497,7 +2509,7 @@ To avoid this type of infeasibility and also study narrow places in the modeled 
 `Switch` has an "switch_model.balancing.unserved_load" module that sets default 500 USD/MWh price on unserved load. (see above)\
 In `energyRt` one can put a dummy-technology or import of electricity with a certain cost that will be used if marginal production costs of electricity in particular hour and region will exceed the price. Below is an example of an unserved load modeled as an import.
 
-```{r}
+```{r, eval=FALSE}
 #| eval: !expr params$build_energyRt
 
 EIMP5 <- newImport(
@@ -2525,7 +2537,7 @@ EIMP100 <- newImport(
 
 ### energyRt: assemble model
 
-```{r}
+```{r, eval=FALSE}
 #| eval: !expr params$build_energyRt
 
 repo <- newRepository("base") |>
