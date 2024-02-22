@@ -1,0 +1,698 @@
+---
+title: "MCET scenarios"
+author: "Multi-Country Electricity Transition Potential and Challenges"
+date:  "`r Sys.Date()`"
+format: 
+  # html:
+  #   code-fold: true
+  #   fig-width: 7
+  #   fig-height: 5
+  #   toc: true
+  pdf:
+    fig-width: 7
+    fig-height: 5
+    toc: true
+execute:
+  echo: false # should the code be echoed in the output document?
+  eval: true # should the code be evaluated? (doesn't override chunk settings)
+  error: false # Include errors in the output (false == stop on error)
+  # warning: false # Include warnings in the output
+  # message: false # Include messages in the output
+params: 
+  
+  # Model choice, defined by selection of a the YAML file
+  
+  
+  # Build and/or solve scenarios (complements)
+  # iso3c: BGD # country code
+  # iso3c: IND # country code
+  # iso3c: KAZ
+  iso3c: THA
+  yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
+  mod_dirname: "scen_pypsa_2050_TOL99" # model (directory) name
+  # add_ccs: false # add ECCG_CCS and ECOA_CCS technologies if not available
+  build_switch: true # write/overwrite Switch model input files
+  solve_switch: true # solve Switch model
+  build_energyRt: false # write/overwrite energyRt model input files
+  solve_energyRt: false # solve energyRt model
+  clean_start: true # will delete the scenario directory before writing
+  No_policy: true # no policy, no carbon constraint
+  Reference: true
+  RES_storage_H2: true
+  RES_storage: true
+  RES_drop_thermal_techs: false # parameter for RES* scenarios
+  Tx_75: true
+  Tx_50: true
+  Tx_25: true
+  Tx_0: true
+  DR_1: true
+  DR_2: true
+  DR_3: true
+  DR_4: true
+editor_options: 
+  chunk_output_type: console
+---
+
+This document takes pre-built (Switch or energyRt) model and creates set of MCET scenarios to solve. Several scenarios require changes in the set of technologies and/or additional constraints. While the structure of the model, shapes of regions (load zones), efficiency parameters and costs of technologies are not affected by the scenarios.
+
+
+```{r setup}
+#| warning: false
+#| message: false
+#| collapse: true
+#| echo: !expr params$echo
+library(here)
+setwd(here())
+source("functions.R")
+stopifnot(mcet_check_installations())
+library(tidyverse)
+library(ggrepel)
+library(glue)
+library(sf)
+library(fst)
+library(data.table)
+library(revaluation)
+library(energyRt)
+library(rlang)
+# library(future)
+fp <- here
+
+# Set country
+rev_set_country(params$iso3c)
+rev_country()
+
+# read configuration file for the country
+p <- rev_read_yaml(path = params$yaml_path, iso3c = params$iso3c)
+
+# import/merge YAML parameters
+for (i in 1:length(params)) {p[[names(params)[i]]] <- params[[i]]}
+
+# load maps
+(load(p$files$gis))
+
+# if (p$use_tech_database) (load("data/repo_pypsa_techs.RData"))
+
+# print(p)
+p$dir$switch <- fp(p$dir$scen, params$mod_dirname, "switch")
+p$dir$energyRt <- fp(p$dir$scen, params$mod_dirname, "energyRt")
+p$homedir <- getwd()
+if (isTRUE(params$build_switch)) message("Switch model: ", p$dir$switch)
+if (isTRUE(params$build_energyRt)) message("energyRt model: ", p$dir$energyRt)
+
+# setup Python to solve scenarios
+if (isTRUE(params$solve_switch)) {
+  library(reticulate)
+  # conda_list()
+  use_condaenv("switch")
+  # use_miniconda("switch")
+  stopifnot(py_module_available("switch_model"))
+  
+  # change working directory
+  os <- import("os")
+  switch_model <- import("switch_model")
+  
+  # add MCET Switch modules
+  mcet_modules <- fp(p$dir$switch, "mcet_modules")
+  if (!dir.exists(mcet_modules)) dir.create(mcet_modules)
+  ff <- list.files("switch_modules/mcet_modules", pattern = "\\.py$",
+                   full.names = TRUE)
+  ff <- sapply(ff, function(f) file.copy(f, mcet_modules, overwrite = T))
+  stopifnot(all(ff)); rm(ff)
+}
+# interim reporting
+total_cost <- list()
+```
+
+## Scenarios
+
+Initial model requirements:
+* one year horizon: 2050   
+* all technologies are implemented in the model, including:   
+  - Conventional generators: thermal, hydro, nuclear, bio, ...
+  - Thermal generators with CCS   
+  - Intermittent renewables: wind, solar   
+  - battery and pumped storage   
+  - hydrogen storage (as a long-term storage)    
+  - transmission  
+
+Load the model
+```{r switch_model}
+#| eval: !expr params$build_switch
+#| include: !expr params$build_switch
+ff <- list.files(fp(p$dir$switch, "inputs"), pattern = ".csv$", 
+                 full.names = T)
+basename(ff)
+inp <- sapply(ff, fread); names(inp) <- basename(names(inp))
+rm(ff)
+
+f <- fp(p$dir$switch, "inputs/modules.txt")
+if (!file.exists(f)) {
+  f2 <- fp(p$dir$switch, "modules.txt")
+  file.copy(f2, f)
+  a <- file.rename(f2, sub("modules.txt", 
+                           "modules-moved-to-inputs.txt", f2))
+  
+}
+if (!file.exists(f)) stop("file ", basename(f), " not found")
+modules.txt <- read_lines(f)
+switch_inputs_version.txt <- read_lines(
+  fp(p$dir$switch, "inputs/switch_inputs_version.txt"))
+options.txt <- read_lines(fp(p$dir$switch, "options.txt"))
+```
+
+
+### No Policy 
+Solving the model without carbon constraint.
+
+#### Solve
+```{r eval= params$solve_switch}
+scen_name <- "No_policy"
+if (params$solve_switch & params$No_policy) { 
+  
+  # change working directory
+  os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  if (any(grepl("switch_model.policies.carbon_policies", options.txt))) {
+    exclude_modules <- c("--exclude-modules",
+                         "switch_model.policies.carbon_policies")
+  } else {
+    exclude_modules <- NULL
+  }
+  # solve
+  switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      exclude_modules,
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+### Reference
+Zero emissions by 2050 (capacity and transmission expansion and dispatch only for 2050), considering existing power plants in the region and their expected retirements, and allowing the following to be built: all renewables (wind, solar, geothermal, biofuels), nuclear, hydro, CCS, hydrogen, batteries, and country-specific storage technologies.  
+
+**Implementation:** 
+Assuming that all technologies are already implemented in the model, the reference case adds zero-carbon constraint.
+```{r switch_reference}
+scen_name <- "Reference"
+# CO2 constraint 
+if (isTRUE(params[[scen_name]])) {
+  if (is_empty(inp$carbon_policies.csv) || params$build_switch) {
+    # add carbon cap
+    inp$carbon_policies.csv <- data.table(
+      PERIOD = 2050,
+      carbon_cap_tco2_per_yr = 0,
+      carbon_cost_dollar_per_tco2 = 0
+    )
+    message("Writing 'carbon_policies.csv'")
+    fwrite(inp$carbon_policies.csv, 
+           file = fp(p$dir$switch, "inputs/carbon_policies.csv"))
+  } else {
+    stopifnot(nrow(inp$carbon_policies.csv) == 1)
+    stopifnot(inp$carbon_policies.csv$PERIOD == 2050)
+    stopifnot(inp$carbon_policies.csv$carbon_cap_tco2_per_yr == 0)
+    stopifnot(inp$carbon_policies.csv$carbon_cost_dollar_per_tco2 == 0)
+  }
+  
+  # add (check) 'carbon_policies' module
+  ii <- grepl("switch_model.policies.carbon_policies", modules.txt)
+  if (any(ii)) {
+    # overwrite in the case of commented
+    modules.txt[ii] <- "switch_model.policies.carbon_policies"
+  } else {
+    modules.txt <- c(modules.txt, "switch_model.policies.carbon_policies")
+  }
+  # drop duplicates
+  modules.txt <- str_trim(modules.txt) |> unique()
+  write_lines(modules.txt, fp(p$dir$switch, "inputs/modules.txt"))
+  
+  # cmd file (windows & conda/switch env.) ####
+  cmd <- c(
+    "call activate switch",
+    paste0("switch solve --outputs-dir outputs-", scen_name),
+    "call conda deactivate",
+    "cmd /k"
+  )
+  write_lines(cmd, fp(p$dir$switch, glue("run_{scen_name}.cmd")))
+  message(glue("'{scen_name}' scenario created."))
+}
+rm(scen_name)
+```
+
+#### Solve
+```{r eval= params$solve_switch}
+scen_name <- "Reference"
+if (params$solve_switch) { 
+  
+  # change working directory
+  os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      "--outputs-dir", "outputs-Reference",
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+#### Read solution
+```{r}
+ff <- list.files(fp(p$dir$switch, "outputs-Reference"), 
+                 pattern = ".(csv|txt)$", 
+                 full.names = T)
+basename(ff)
+out_ref <- sapply(ff, fread); names(out_ref) <- basename(names(out_ref))
+rm(ff)
+total_cost[["Reference"]] <- out_ref$total_cost.txt[[1]]
+if (isTRUE(out_ref$total_cost.txt[[1]] > 0)) {
+  message("Reference case objective: $", 
+          format(total_cost[["Reference"]], big.mark = ","))
+} else {
+  stop("Reference scenario solution not found")
+}
+```
+
+### RES_storage_H2
+Zero emissions by 2050 (capacity and transmission expansion and dispatch only for 2050), considering existing power plants in the region and their expected retirements, and allowing the following to be built: wind, solar, batteries, hydro, and hydrogen.  
+**Implementation:**  
+Filter out (or disable investment in) thermal generation technologies. 
+```{r, eval=params$RES_storage_H2}
+scen_name <- "RES_storage_H2"
+inp |> names()
+inp$fuels.csv
+inp$gen_info.csv$gen_tech |> unique()
+
+if (params$RES_drop_thermal_techs) {
+  # Drop thermal generators 
+  drop_fuels <- "LIG|OIL|GAS|COA|NUC"
+  inp2 <- inp
+  
+  inp2$fuels.csv <- inp$fuels.csv |> 
+    filter(!grepl(drop_fuels, fuel))
+  
+  inp2$fuel_cost.csv <- inp$fuel_cost.csv |> 
+    filter(!grepl(drop_fuels, fuel))
+  
+  inp2$gen_info.csv <- inp$gen_info.csv |>
+    filter(!grepl(drop_fuels, gen_energy_source))
+  
+  inp2$gen_build_predetermined.csv <- inp$gen_build_predetermined.csv |>
+    filter(GENERATION_PROJECT %in% inp2$gen_info.csv$GENERATION_PROJECT)
+  
+  inp2$gen_build_costs.csv <- inp$gen_build_costs.csv |>
+    filter(GENERATION_PROJECT %in% inp2$gen_info.csv$GENERATION_PROJECT)
+} else {
+  # prevent investment in thermal generation
+  noinv_techs <- "_(ELIG|EOIL|EGAS|ECOA|ENUC)" # mask to drop techs
+  inp2 <- inp
+  inp2$gen_build_costs.csv <- inp$gen_build_costs.csv |>
+    filter(!grepl(noinv_techs, GENERATION_PROJECT) | build_year < 2050)
+}
+
+inp2_dir <- fp(p$dir$switch, glue("inputs-{scen_name}"))
+if (params$clean_start) try(unlink(inp2_dir))
+dir.create(inp2_dir, showWarnings = F)
+
+message("Writing files in '", basename(inp2_dir), "':")
+for (f in names(inp2)) {
+  fn <- fp(inp2_dir, f)
+  cat(f, "\n")
+  fwrite(inp2[[f]], file = fn)
+}
+# add txt-files
+write_lines(modules.txt, fp(inp2_dir, "modules.txt"))
+write_lines(switch_inputs_version.txt, 
+            fp(inp2_dir, "switch_inputs_version.txt"))
+setwd(here())
+rm(scen_name)
+```
+
+#### Solve
+```{r eval=params$solve_switch}
+scen_name <- "RES_storage_H2"
+if (params$solve_switch & params$RES_storage_H2) { 
+  # change working directory
+  # os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      "--inputs-dir", glue("inputs-{scen_name}"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+### RES_storage
+Zero emissions by 2050 (capacity and transmission expansion and dispatch only for 2050), considering existing power plants in the region and their expected retirements, and allowing the following to be built: wind, solar, batteries, and hydro.
+
+```{r eval=params$build_switch}
+scen_name <- "RES_storage"
+inp |> names()
+inp$fuels.csv
+inp$gen_info.csv$gen_tech |> unique()
+
+# prevent investment in H2 techs
+noinv_techs <- "_(ELIG|EOIL|EGAS|ECOA|ENUC|H2)" # mask to drop techs
+inp3 <- inp2
+inp3$gen_build_costs.csv <- inp2$gen_build_costs.csv |>
+  filter(!grepl(noinv_techs, GENERATION_PROJECT) | build_year < 2050)
+
+inp3_dir <- fp(p$dir$switch, glue("inputs-{scen_name}"))
+if (params$clean_start) try(unlink(inp3_dir))
+dir.create(inp3_dir, showWarnings = F)
+
+message("Writing files in '", basename(inp2_dir), "':")
+for (f in names(inp3)) {
+  fn <- fp(inp3_dir, f)
+  cat(f, "\n")
+  fwrite(inp3[[f]], file = fn)
+}
+# add txt-files
+write_lines(modules.txt, fp(inp3_dir, "modules.txt"))
+write_lines(switch_inputs_version.txt, 
+            fp(inp3_dir, "switch_inputs_version.txt"))
+setwd(here())
+message("Scenario '", scen_name, "' input files created.")
+rm(scen_name)
+
+```
+
+#### Solve
+```{r eval=params$solve_switch}
+scen_name <- "RES_storage"
+if (params$solve_switch & params$RES_storage) { 
+  # change working directory
+  # os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      "--inputs-dir", glue("inputs-{scen_name}"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+### Transmission constraints
+```{r}
+ref_BuildTx <- inp$transmission_lines.csv |>
+  select(matches("TRANSMISSION|length")) |>
+  left_join(out_ref$BuildTx.csv, 
+            by = c(TRANSMISSION_LINE = "TRANS_BLD_YRS_1")) |>
+  mutate(MW_km = BuildTx * trans_length_km)
+  
+ref_BuildTx_MW_km <- ref_BuildTx$MW_km |> sum()
+stopifnot(ref_BuildTx_MW_km > 0) 
+
+for (i in seq(0, .75, by = .25)) {
+  fname <- glue("transmission_limit_mw_km_{i*100}.csv")
+  message(glue("Writing {fname}"))
+  tx_lim <- data.table(
+    PERIOD = 2050,
+    trans_expansion_limit_mw_km = i * ref_BuildTx_MW_km
+  )
+  fwrite(tx_lim, fp(p$dir$switch, "inputs", fname))
+  rm(fname, tx_lim)
+}
+
+```
+
+**Tx_75**
+Reference (scenario_id = 1) + constraint on allowed transmission expansion up to 75% compared to the Reference results. Cap on sum MW-km of transmission expanded, and decreasing that cap to understand/identify key corridors for each country and its implications for storage and the energy mix.
+
+**Tx_50**
+Up to 50% compared to the reference
+
+**Tx_25**
+Up to 25% compared to the reference
+
+**Tx_0**
+No Tx expansion allowed in the reference
+
+#### Solve
+```{r eval=params$solve_switch}
+for (i in c(75, 50, 25, 0)) {
+  scen_name <- glue("Tx_{i}")
+  if (params$solve_switch & p[[scen_name]]) { 
+    message("Solving '", scen_name, "'")
+    # stop()
+    # change working directory
+    os$chdir(p$dir$switch)
+
+    # solve
+    # switch_model <- import("switch_model")
+    switch_model$solve$main(
+      args = c(
+        # "--inputs-dir", glue("inputs-{scen_name}"),
+        "--outputs-dir", glue("outputs-{scen_name}"),
+        "--include-modules", "mcet_modules.new_transmission_limit",
+        "--input-alias",
+        glue("new_transmission_limit.csv=transmission_limit_mw_km_{i}.csv"),
+        "--verbose",
+        "--stream-solver",
+        "--no-save-solution",
+        "--solver", "cplex",
+        "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+    setwd(here())
+    total_cost[[scen_name]] <- read_lines(
+      fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+    ) |> as.numeric()
+  }
+}
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+
+### Demand responce
+```{r}
+flexible_loads <- fread(fp("switch_modules/mcet_modules", 
+                           "flexible_loads.csv"))
+flexible_loads$PERIOD <- 2050
+
+flexible_loads_by_zone_i <- fread(fp("switch_modules/mcet_modules",
+                                   "flexible_loads_by_zone.csv"))[1,]
+flexible_loads_by_zone_i$PERIOD <- 2050
+
+flexible_loads_by_zone <- lapply(inp$load_zones.csv$LOAD_ZONE, function(x) {
+  flexible_loads_by_zone_i$ZONES <- x
+  flexible_loads_by_zone_i
+}) |> rbindlist()
+rm(flexible_loads_by_zone_i)
+```
+
+#### Solve DR_1
+**DR_1** - Reference + flexible_loads
+```{r eval=params$solve_switch}
+scen_name <- "DR_1"
+if (params$solve_switch & p[[scen_name]]) { 
+  fwrite(flexible_loads, fp(p$dir$switch, "inputs", "flexible_loads.csv"))
+  # change working directory
+  # os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      # "--inputs-dir", glue("inputs-{scen_name}"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+#### Solve DR_2
+**DR_2** - Reference + flexible_loads_by_zone
+```{r eval=params$solve_switch}
+scen_name <- "DR_2"
+if (params$solve_switch & p[[scen_name]]) { 
+  fwrite(flexible_loads_by_zone, 
+         fp(p$dir$switch, "inputs", "flexible_loads.csv"))
+  # change working directory
+  # os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      # "--inputs-dir", glue("inputs-{scen_name}"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+#### Solve DR_3
+**DR_3** - RES_storage + flexible_loads
+```{r eval=params$solve_switch}
+scen_name <- "DR_3"
+if (params$solve_switch & p[[scen_name]]) { 
+  fwrite(flexible_loads, 
+         fp(p$dir$switch, "inputs-RES_storage", "flexible_loads.csv"))
+  # change working directory
+  # os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      "--inputs-dir", glue("inputs-RES_storage"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+#### Solve DR_4
+**DR_4** - RES_storage + flexible_loads_by_zone
+```{r eval=params$solve_switch}
+scen_name <- "DR_4"
+if (params$solve_switch & p[[scen_name]]) { 
+  fwrite(flexible_loads_by_zone, 
+         fp(p$dir$switch, "inputs-RES_storage", "flexible_loads.csv"))
+  # change working directory
+  # os <- import("os")
+  os$getcwd()
+  os$chdir(p$dir$switch)
+  os$getcwd()
+    
+  # solve
+  # switch_model <- import("switch_model")
+  switch_model$solve$main(
+    args = c(
+      "--inputs-dir", glue("inputs-RES_storage"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+      "--verbose",
+      "--stream-solver",
+      "--no-save-solution",
+      "--solver", "cplex",
+      "--solver-options-string", "'lpmethod=4 solutiontype=2'"
+      )
+    )
+}
+setwd(here())
+total_cost[[scen_name]] <- read_lines(
+  fp(p$dir$switch, glue("outputs-{scen_name}"), "total_cost.txt")
+) |> as.numeric()
+sapply(total_cost, function(x) format(x, big.mark = ","))
+rm(scen_name)
+```
+
+
+## THE END
+```{r}
+
+```
+

@@ -22,8 +22,11 @@ execute:
 
 # Model parameters
 params: 
-  iso3c: BGD # country code
+  # iso3c: BGD # country code
   # iso3c: IND # country code
+  # iso3c: KAZ
+  # iso3c: THA
+  iso3c: CHN
   
   # Model choice, defined by selection of a the YAML file
   yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
@@ -53,12 +56,23 @@ params:
   win_landuse_up: .5 # max share of used land per cluster for onshore wind [0-1]
   wif_landuse_up: .0 # max share of used area per cluster for offshore wind 
   # add_offshore_wind: false # add offshore wind - not implemented yet
+  ## 3. CCS
+  add_ccs: false # add ECCG_CCS and ECOA_CCS technologies if not available
+  # if use_tech_database is false, use adjustments:
+  ccs_capture_rate: 0.9 # parameter from 0 to 1, share of CO2 captured
+  ccs_efficiency_factor: 0.9 # efficiency adjustment
+  ccs_fixom_factor: 1.5 # multiplier to fixed O&M (inl. annualized capital)
+  ccs_varom_factor: 1.5 # multiplyer to variable O&M
+  ## 4. Base year, adjust existing capacity and the load
+  set_base_year: 2050
+  thermal_capacity_factor: .5 # retired share of existing capacity by the BY
+  load_growth_factor: 3 # load multiplier
   
-  ## 3. Update PyPSA-Earth dataset with MERRA2 data
+  ## 5. Update PyPSA-Earth dataset with MERRA2 data
   update_pypsa_model: false # only for CL1_TOL1 - one cluster per region
   new_pypsa_file_ending: "_merra.nc" # adds to the modified nc-file
   
-  # YAML file parameters can be overwritten here
+  # YAML-file parameters (from 'yaml_path:...') can be overwritten here
   # fig_map_width: 6
   # ...
 editor_options: 
@@ -80,18 +94,20 @@ editor_options:
 ```{r, eval=FALSE}
 #| eval: false
 ## To execute this file:
-# adjust parameters (in YAML header) and run this command, 
+# adjust parameters (in YAML header), save, and run this command, 
 # specifying country and the model
 # ?quarto::quarto_render # for help
 quarto::quarto_render(
   input = "import_pypsa_model.qmd",
   # output_file = "import_pypsa_model_BGD.pdf",
-  output_file = "import_pypsa_model_IND.pdf",
+  # output_file = "import_pypsa_model_IND.pdf",
   # output_file = "import_pypsa_model_THA.pdf",
+  output_file = "import_pypsa_model_KAZ.pdf",
   execute_params = list(
     # iso3c = "BGD", 
-    iso3c = "IND",
-    # iso3c = "THA", 
+    # iso3c = "IND",
+    # iso3c = "THA",
+    iso3c = "KAZ",
     yaml_path = "config/mod_toy"
     )
   )
@@ -155,6 +171,7 @@ pypsa_config <- yaml::read_yaml(p$files$pypsa_yaml)
 
 # import the model year
 p$base_year <- pypsa_config$load_options$prediction_year
+if (params$set_base_year > 0) p$base_year <- p$set_base_year
 p$weather_year <- pypsa_config$load_options$weather_year
 p$discount <- pypsa_config$costs$discountrate
 
@@ -421,6 +438,24 @@ comm <- filter(carriers, !drop) |>
   )
 ```
 
+### Add CCS-fuels
+In the case if CCS technologies are not included, they will be added for ECOA and ECCG with generic assumptions of 90% efficiency, 50% higher variable costs, and 
+```{r, eval=params$add_ccs}
+#| eval: !expr params$add_ccs
+
+# add COA_CCS and GAS_CCS
+comm_ccs <- comm |> 
+  filter(grepl("COA|GAS", comm)) |>
+  mutate(
+    carriers_i = paste(carriers_i, "ccs", sep = "_"),
+    carriers_nice_name = paste(carriers_nice_name, "CCS", sep = " "),
+    comm = paste(comm, "CCS", sep = "_"),
+    carriers_co2_emissions = carriers_co2_emissions * params$ccs_capture_rate
+  )
+
+comm <- comm |> bind_rows(comm_ccs) |> unique()
+```
+
 ### energyRt: commodities
 
 ```{r}
@@ -449,6 +484,7 @@ if (nrow(comm) > 0) {
 } 
 repo_comm@data |> names()
 ```
+
 
 ### switch: fuels.csv
 
@@ -555,7 +591,9 @@ dem <- nc$loads |>
   left_join(timedim, by = "snapshots") |>
   mutate(
     yday = as.integer(str_extract(slice, "[0-9]++")),
-    hour = as.integer(str_extract(slice, "[0-2][0-9]$")))
+    hour = as.integer(str_extract(slice, "[0-2][0-9]$")),
+    loads_t_p_set = params$load_growth_factor * loads_t_p_set
+    )
 
 loads_byday <- dem |>
   group_by(hour, region) |>
@@ -700,8 +738,8 @@ if (nrow(network) > 0) {
         region = c(network$region.x[i], network$region.y[i]),
         invcost = rep(network$lines_capital_cost[i] / 2, 2) * 2 # olife == 2
       ),
-      olife = 2, # doubled annualized invcost for consistency 
-      stock = data.frame(
+      olife = list(olife = 2), # doubled annualized invcost for consistency 
+      capacity = data.frame(
         # year = 
         stock = network$lines_s_nom[i]
       ),
@@ -1230,6 +1268,8 @@ gen <- nc$generators |>
     gen = str_replace(generators_i, bus, ""),
     gen = str_trim(gen),
     tech_name = substr(paste0("E", toupper(gen)), 1, 4), # !!! ToDo: Write a function
+    # allow all techs for investment
+    generators_p_nom_extendable = if_else(generators_capital_cost > 0, 1L, 0L),
     is_variable = ifelse(grepl("win|sol|ror", generators_i), TRUE, FALSE) #!!!
   ) |>
   left_join(reg_names, by = "bus")
@@ -1320,6 +1360,27 @@ fig_gen_cap
 fig_gen_cap_max
 ```
 
+### Add CCS-techs
+```{r, eval=params$add_ccs}
+#| eval: !expr params$add_ccs
+gen_ccs <- gen |> 
+  filter(grepl("COA|GAS", comm)) |>
+  filter(grepl("ECOA|ECCG", tech_name)) |>
+  mutate(
+    comm = paste(comm, "CCS", sep = "_"),
+    tech_name = paste(tech_name, "CCS", sep = "_"),
+    generators_p_nom_extendable = 1L,
+    generators_capital_cost = generators_capital_cost * params$ccs_fixom_factor,
+    generators_marginal_cost = 
+      generators_marginal_cost * params$ccs_varom_factor,
+    generators_efficiency = 
+      generators_efficiency * params$ccs_efficiency_factor
+  )
+
+gen <- gen |> bind_rows(gen_ccs) |> unique()
+
+```
+
 ### energyRt: technologies (generators)
 
 ```{r}
@@ -1362,7 +1423,7 @@ for (tch in unique(gen$tech_name)) {
           region = x$region,
           varom = x$generators_marginal_cost
         ),
-        stock = list(
+        capacity = list(
           region = x$region,
           stock = x$generators_p_nom
         )
@@ -1370,7 +1431,7 @@ for (tch in unique(gen$tech_name)) {
     }
   
   # update pre-existing capacity (from PyPSA-model)
-  tech <- update(tech, stock = data.frame(
+  tech <- update(tech, capacity = data.frame(
     year = p$base_year,
     region = x$region,
     stock = x$generators_p_nom
@@ -1695,7 +1756,7 @@ if (nrow(phs) > 0) {
       #   region = x$region,
       #   invcost = x$storage_units_capital_cost
       # ),
-      stock = list(
+      capacity = list(
         region = x$region,
         stock = x$storage_units_p_nom
       )
@@ -1928,7 +1989,7 @@ if (nrow(hydro) > 0) {
         comm = x$comm,
         cinp2use = x$storage_units_efficiency_dispatch
       ),
-      stock = list(
+      capacity = list(
         region = x$region,
         stock = x$storage_units_p_nom 
       ),
@@ -1944,7 +2005,7 @@ if (nrow(hydro) > 0) {
       commodity = unique(x$comm),
       cap2stg = 6,
       region = unique(x$region),
-      stock = list(
+      capacity = list(
         region = x$region,
         stock = x$storage_units_p_nom
       ),
@@ -2362,7 +2423,7 @@ financials
 
 ```{r}
 #| eval: !expr params$build_switch
-fl <- file.path(p$scen$BASE$switch, "modules.txt")
+fl <- file.path(p$scen$BASE$switch, "inputs/modules.txt")
 cat("# Core Modules", "\n", file = fl, append = FALSE)
 cat("switch_model", "\n", file = fl, append = TRUE)
 cat("switch_model.timescales", "\n", file = fl, append = TRUE)
@@ -2405,7 +2466,7 @@ rm(fl)
 ### switch: solve
 
 ```{r}
-#| eval: !expr params$solve_switch
+#| eval: !expr params$build_switch
 
 # "conda info --envs"
 fl <- file.path(p$scen$BASE$switch, "run_switch.cmd")
@@ -2485,6 +2546,17 @@ repo <- newRepository("base") |>
     DEMELC # load curve
   )
 
+# Optional: all commodities set to "HOUR" timeframe"
+if (F) {
+  for (ob in repo@data) {
+    if (.hasSlot(ob, "timeframe") && length(ob@timeframe) > 0 &&
+        grepl("ANNUAL|YDAY", ob@timeframe)) {
+      ob <- update(ob, timeframe = "HOUR")
+      repo <- add(repo, ob, overwrite = T)
+    }
+  }
+}
+
 timetable_d365_h24 <- make_timetable(
   struct = list(
     ANNUAL = "ANNUAL",
@@ -2517,44 +2589,13 @@ save(mod, file = file.path(p$scen$BASE$energyRt, "energyRt_model.RData"))
 #| eval: false
 #| include: false
 # eval: !expr params$solve_energyRt
-
-
+# show_progress_bar()
+set_progress_bar("bw")
 scen_pypsa_base <- interpolate(
   mod, 
   name = p$scen$BASE$name,
   path = p$scen$BASE$energyRt
 )
+scen_pypsa_base@path
 
-try(source("tmp/gams_config.R"))
-# source("tmp/solver_options.R")
-scen_pypsa_base_gams <- write_script(
-  scen_pypsa_base, 
-  solver = GAMS_barrier
-  # solver = GAMS_mac,
-  # tmp.dir = file.path(p$scen$BASE$root, "GAMS")
-  )
-
-# scen_pypsa_base_gams@misc$tmp.dir 
-
-# solve(scen_pypsa_base_gams, wait = F)
-# scen_pypsa_base_gams <- read(scen_pypsa_base_gams)
-# summary(scen_pypsa_base_gams)
-# fname <- file.path(p$scen$BASE$root, glue("{p$scen$BASE$name}.RData"))
-# print(paste("Savinn:", fname, "\n"))
-# save(scen_pypsa_base_gams, file = fname)
-
-# scen_PyPSA_Pyomo <- 
-#   write(scen_PyPSA, solver = Pyomo, 
-#         tmp.dir = file.path(p$dir$scen, "PyPSA", "Pyomo"))
-# scen_PyPSA_Pyomo@misc$tmp.dir
-# solve(scen_PyPSA_Pyomo, wait = F)
-
-# scen_PyPSA_GAMS <- read(scen_PyPSA_GAMS)
-# summary(scen_PyPSA_GAMS)
-# save(scen_PyPSA_GAMS, file = file.path(p$dir$scen, "scen_PyPSA_GAMS.RData"))
-
-# scen <- scen_pypsa_base_gams
-# getData(scen, "vTechCap", merge = T, digits = 3) |> as.data.table()
-# getData(scen, c("vTechNewCap", "vStorageNewCap"), merge = T, 
-#         digits = 2, drop.zeros = T, process = T) |> as.data.table()
 ```
