@@ -1,0 +1,45 @@
+# Country iso-codes: https://en.wikipedia.org/wiki/List_of_ISO_3166_country_codes
+country: Vietnam
+iso3c: &iso3c VNM # alpha-3 code
+iso2c: &iso2c VN # alpha-2 code
+# https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+tmz: Asia/Saigon # Timezone
+
+# Model choice
+model: &mod mod_toy # 
+# model: &mod mod_toy # simplified model with 10-20 artificial regions
+# model: &mod mod_adm # model with administrative regions
+# model: &mod mod_custom # model with custom regions
+
+# Default project directories
+dir:
+  # data
+  data: &data [data, *iso3c] # generic data directory
+  data_mod: &data_mod [*data, *mod] # model-version-specific data (subset)
+  pypsa_data: &pypsa_data [data/PyPSA-kits, *mod, *iso2c] # PyPSA model files (to import)
+  gwa: &gwa [*data, gwa] # Global Wind Atlas raster-files
+  gadm: &gadm [*data, gadm] # shapefiles of administrative boundaries from GADM
+  merra2: &merra2 [*data, merra2] # MERRA2 data for the country
+  nrel: &nrel [*data, nrel] # NREL data for the country
+  # scenarios
+  scen: &scen [scenarios, *iso3c, *mod]
+  # reporting
+  reports: &repo [reports, *iso3c]
+  reports_mod: &repo_mod [*repo, *mod]
+
+  fig: &fig [figures, *iso3c]
+  fig_mod: &fig_mod [*fig, *mod]
+  fig_scen: &fig_scen [*scen, figures]
+  # misc
+  tmp: &tmp [tmp, *iso3c]
+
+# Key files
+files:
+  gis: [*data_mod, gis.RData]
+  pypsa_yaml: [*pypsa_data, 'config.yaml']
+  pypsa_network: [*pypsa_data, 'networks/elec_s_10_ec_lcopt_Co2L-1H.nc']
+  pypsa_busmap: [*pypsa_data, 'resources/bus_regions/busmap_elec_s_10.csv']
+
+# Parameters
+fig_map_width: 5 # inches, map figure width
+fig_map_height: 6 # inches, map figure height (both define the ratio)

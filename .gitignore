@@ -55,20 +55,20 @@ data/*/gwa/
 data/*/nrel/
 data/*/mod_adm/
 
-*/*/*IND*
-*/*/*CHN*
-*/*/*CHL*
-*/*/*COL*
-*/*/*MYS*
-*/*/*THA*
-*/*/*VNM*
+#*/*/*IND*
+#*/*/*CHN*
+#*/*/*CHL*
+#*/*/*COL*
+#*/*/*MYS*
+#*/*/*THA*
+#*/*/*VNM*
 #*/*/*KAZ*
 
 #*/IND/*
 #*/CHN/*
 #*/CHL/*
 #*/COL/*
-*/MYS/*
+#*/MYS/*
 #*/THA/*
 #*/VNM/*
 #*/KAZ/*
@@ -83,7 +83,18 @@ last_config.RData
 *.html
 figures/*
 *.Rmd
+*.rmarkdown
+
+# oldies
 _scenarios/
+_config*
+
+# locals
+tmp/*
+
+# large output
+scenarios/
+
 
 *TOL00*
 *TOL01*
@@ -92,6 +103,7 @@ _scenarios/
 *TOL05*
 *TOL20*
 *2019*
+*2014*
 *last_config*
 data/rev_data*
 

@@ -1,0 +1,43 @@
+# Country iso-codes: https://en.wikipedia.org/wiki/List_of_ISO_3166_country_codes
+country: Malaysia
+iso3c: &iso3c MYS # alpha-3 code
+iso2c: &iso2c MY  # alpha-2 code
+# https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+tmz: Asia/Kuala_Lumpur
+
+model: &mod mod_toy # simplified model with few artificial regions
+# model: &mod mod_adm # model with administrative regions
+
+# Directories (see "default project directories" in the INFO section below)
+dir:
+  # data locations
+  data: &data [data, *iso3c] # top folder for all data
+  data_mod: &data_mod [*data, *mod] # model-version-specific data
+  tmp: &tmp [tmp, *iso3c] # temporary files
+  pypsa_data: &pypsa_data [data/PyPSA-kits, *mod, *iso2c] # PyPSA model files (to import)
+  gwa: &gwa [*data, gwa] # Global Wind Atlas raster-files
+  gadm: &gadm [*data, gadm] # shapefiles of administrative boundaries from GADM
+  merra2: &merra2 [*data, merra2] # MERRA2 data for the country
+  nrel: &nrel [*data, nrel] # NREL data for the country
+  # scenarios
+  scen: &scen [scenarios, *iso3c, *mod] # scenarios
+  # pypsa_scen: &pypsa_scen [*scen, pypsa] # imported (solved) PyPSA scenarios
+  # switch: &switch [*scen, switch] # solved Switch scenarios
+  # energyRt: &switch [*scen, energyRt] # solved energyRt scenarios
+  # reporting
+  reports: &repo [reports, *iso3c]
+  reports_mod: &repo_mod [*repo, *iso3c]
+  fig: &fig [figures, *iso3c]
+  fig_mod: &fig_mod [*fig, *mod]
+
+# Key files
+files:
+  gis: [*data_mod, gis.RData] # map choice: file in "data" directory
+  pypsa_yaml: [*pypsa_data, "config.yaml"]
+  pypsa_network: [*pypsa_data, "networks/elec_s_10_ec_lcopt_Co2L-1H.nc"]
+  pypsa_busmap: [*pypsa_data, "resources/bus_regions/busmap_elec_s_10.csv"]
+  # merra: [*merra2, *mod, merra.fst]
+
+fig_map_width: 6.
+fig_map_height: 3.
+
