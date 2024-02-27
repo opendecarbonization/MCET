@@ -1,6 +1,7 @@
 --verbose
 --stream-solver
 --no-save-solution
+--suffix dual  # needed for cplex & gurobi solvers w/ Switch 2.0.7
 
 # cplex barrier no crossover:
 --solver cplex
