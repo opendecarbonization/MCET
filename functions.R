@@ -382,5 +382,372 @@ rev_theme_void <- function() {
       plot.subtitle = element_text(hjust = 0.5))
 }
 
+#### MCET scenarios ####
+# Make MCET scenarios routine for an existing Switch model
+
+make_mcet_scenarios_queue_1 <- function(
+  ## Point to the Switch-model directory
+  # switch_dir = "scenarios/ISO-test/mod_toy/scen_pypsa_2050_TOL99/switch",
+  switch_dir,
+  # point to Switch-MCET-modules
+  copy_mcet_modules_from = "switch_modules/mcet_modules",
+  mcet_modules_location = "switch_modules/mcet_modules",
+  hydrogen_module = FALSE, # not implemented
+  # Pattern or list of thermal generators to "mute" for new investments
+  thermal_techs_pattern = "ECOA|EGAS|EOCG|EOIL|ECCG|ELIG|_CCS",
+  fossil_fuels_pattern = "COA|GAS|OIL|CCG|OCG|LIG|CCS",
+  H2_techs_pattern = "STG_H2",
+  H2_pattern = "^H2$",
+  base_year = 2050,
+  # modules_file
+  modules_file = "inputs/modules.txt",
+  options_file = "options.txt",
+  scenarios_file = "scenarios.txt",
+  modules_default = c(
+    "# Core Modules",
+    "switch_model",
+    "switch_model.timescales",
+    "switch_model.financials",
+    "switch_model.balancing.load_zones",
+    "switch_model.energy_sources.properties",
+    "switch_model.generators.core.build",
+    "switch_model.generators.core.dispatch",
+    "switch_model.reporting",
+    "# Custom Modules",
+    "# switch_model.transmission.local_td",
+    "switch_model.generators.core.no_commit",
+    "# switch_model.energy_sources.fuel_costs.markets",
+    "switch_model.energy_sources.fuel_costs.simple",
+    "switch_model.transmission.transport.build",
+    "switch_model.transmission.transport.dispatch",
+    "switch_model.balancing.unserved_load",
+    "switch_model.generators.extensions.storage",
+    "switch_model.policies.carbon_policies"
+  ),
+  # modules_mcet = c(
+  #   "mcet_modules.dates",
+  #   "mcet_modules.flexible_loads",
+  #   "mcet_modules.new_transmission_limit"
+  # )
+  # mcet_scenarios = "All"
+  overwrite = TRUE,
+  verbose = TRUE
+) {
+  require("tidyverse")
+  require("data.table")
+  require("glue")
+  fp <- file.path
+
+  fWrt <- function(f, append = FALSE) {
+    if (file.exists(f)) {
+      if (!overwrite) {
+        stop("File ", f, " already exists.\n",
+             "use 'overwrite = TRUE' to overwrite it.")
+      } else {
+        verb <- if_else(append, "Appending", "Overwriting")
+      }
+    } else {
+      verb <- "Writing"
+    }
+    if (verbose) message(verb, ": ", basename(f))
+    return(TRUE)
+  }
+
+  append_lines <- function(new_lines, f, unique_only = TRUE) {
+    if (file.exists(f)) {
+      content <- read_lines(f) |> c(new_lines)
+    } else {
+      content <- new_lines
+    }
+    if (anyDuplicated(content)) {
+      if (unique_only) {
+        warning("Dropping duplicated rows found in ", basename(f))
+        content <- unique(content)
+      } else {
+        warning("Duplicated rows found in ", basename(f))
+      }
+    }
+    write_lines(content, f, append = FALSE)
+  }
+  # browser()
+  if (!is.null(mcet_modules_location)) {
+    stopifnot(dir.exists(mcet_modules_location))
+    ff <- list.files(fp(mcet_modules_location), pattern = "\\.py$",
+                     full.names = TRUE)
+    message("Copying ", length(ff), " switch mcet_modules")
+    if (!dir.exists(fp(switch_dir, "mcet_modules"))) {
+      dir.create(fp(switch_dir, "mcet_modules"), showWarnings = F)
+    }
+    ff <- sapply(ff, function(x) {
+      # cat(f, fp(switch_dir, "mcet_modules"), "\n")
+      file.copy(x, fp(switch_dir, "mcet_modules", basename(x)), overwrite = T)
+      })
+  }
+
+  # check if there are two versions of "modules.txt"
+  if (file.exists(fp(switch_dir, "modules.txt")) &
+      file.exists(fp(switch_dir, "inputs/modules.txt"))) {
+    stop("Two versions of 'modules.txt' found:\n",
+         switch_dir, "/modules.txt\n",
+         switch_dir, "/inputs/modules.txt\n",
+         "Delete or rename one of them to proceed."
+    )
+  }
+
+  # check if there are two versions of "options.txt"
+  if (file.exists(fp(switch_dir, "options.txt")) &
+      file.exists(fp(switch_dir, "inputs/options.txt"))) {
+    stop("Two versions of 'options.txt' found:\n",
+         switch_dir, "/options.txt\n",
+         switch_dir, "/inputs/options.txt\n",
+         "Delete or rename one of them to proceed."
+    )
+  }
+
+  if (!is.null(modules_file)) {
+    # check if modules.txt exists
+    if (file.exists(fp(switch_dir, modules_file))) {
+      modules <- read_lines(fp(switch_dir, modules_file))
+    } else {
+      stop("File does not exists\n", fp(switch_dir, modules_file))
+    }
+  } else {
+    message("Adding default 'modules.txt'")
+  }
+  # !!!ToDo: add modules' check
+
+  # Initiate 'scenarios.txt'
+  scenarios_no_tx.txt <- c(
+    "# The first set of MCET project scenarios (without transmission constraints).",
+    "# Run the following command to execute scenarios in the queue one by one",
+    glue("# switch solve-scenarios --scenario-file {scenarios_file}"),
+    ""
+  )
+  f_no_tx <- fp(switch_dir, scenarios_file)
+  if (fWrt(f_no_tx)) write_lines(scenarios_no_tx.txt, f_no_tx)
+
+  # No_policy ####
+  # Scenario without carbon constraint.
+  scen_name <- "No_policy"
+  message("Creating '", scen_name,"' scenario")
+  ii <- grepl("policies.carbon_policies$", modules)
+  if (any(ii)) {
+    ii <- ii & !grepl("^#", modules)
+    if (sum(ii) > 1) stop("Duplicated 'carbon_policies' in 'modules.txt' file")
+    modules[ii] <- paste0("#", modules[ii])
+  }
+
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "--exclude-modules", "switch_model.policies.carbon_policies",
+    "\n"
+  ),
+  file = f_no_tx, append = TRUE)
+
+
+  # Reference ####
+  scen_name <- "Reference"
+  message("Creating '", scen_name, "' scenario")
+  # add/overwrite carbon_policies.csv
+  carbon_policies.csv <- data.table(
+    PERIOD = 2050,
+    carbon_cap_tco2_per_yr = 0,
+    carbon_cost_dollar_per_tco2 = 0
+  )
+  f <- fp(switch_dir, "inputs/carbon_policies.csv")
+  if (fWrt(f)) write_lines(carbon_policies.csv, f)
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+  # RES_storage_H2 ####
+  # Zero emissions by 2050 (capacity and transmission expansion and dispatch only for 2050), considering existing power plants in the region and their expected retirements, and allowing the following to be built: wind, solar, batteries, hydro, and hydrogen.
+  message("Creating '", scen_name, "' scenario")
+  scen_name <- "RES_storage_H2"
+  gen_build_costs.csv <- fread(fp(switch_dir, "inputs/gen_build_costs.csv"))
+  gen_info.csv <- fread(fp(switch_dir, "inputs/gen_info.csv"))
+  # Create inputs for RES_storage_H2 (drop thermal techs)
+  # identify projects (tech) to drop
+  techs_to_drop <- NULL
+  if (!is.null(thermal_techs_pattern) && thermal_techs_pattern != "") {
+    ii <- grepl(thermal_techs_pattern, gen_build_costs.csv$GENERATION_PROJECT)
+    techs_to_drop <- gen_build_costs.csv$GENERATION_PROJECT[ii] |> unique()
+  }
+  if (!is.null(fossil_fuels_pattern) && fossil_fuels_pattern != "") {
+    # techs with fossil fuels
+    jj <- grepl(fossil_fuels_pattern, gen_info.csv$gen_energy_source)
+    techs_to_drop <- c(techs_to_drop, gen_info.csv$GENERATION_PROJECT[jj]) |>
+      unique()
+  }
+  # drop fossil-fuels techs except projects built before base-year
+  gen_build_costs_RES_storage_H2.csv <- gen_build_costs.csv |>
+    filter(!(GENERATION_PROJECT %in% techs_to_drop) | build_year < base_year)
+  f <- fp(switch_dir, "inputs/gen_build_costs_RES_storage_H2.csv")
+  if (fWrt(f)) fwrite(gen_build_costs_RES_storage_H2.csv, f); rm(f)
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--input-aliases", "gen_build_costs.csv=gen_build_costs_RES_storage_H2.csv",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+
+  # RES_storage ####
+  # Zero emissions by 2050 (capacity and transmission expansion and dispatch only for 2050), considering existing power plants in the region and their expected retirements, and allowing the following to be built: wind, solar, batteries, and hydro.
+  scen_name <- "RES_storage"
+  message("Creating '", scen_name, "' scenario")
+  if (!is.null(H2_techs_pattern) && H2_techs_pattern != "") {
+    ii <- grepl(H2_techs_pattern, gen_build_costs.csv$GENERATION_PROJECT)
+    techs_to_drop <- c(techs_to_drop,
+                       gen_build_costs.csv$GENERATION_PROJECT[ii]) |>
+      unique()
+  }
+  if (!is.null(H2_pattern) && H2_pattern != "") {
+    # techs with fossil fuels
+    jj <- grepl(H2_pattern, gen_info.csv$gen_energy_source)
+    techs_to_drop <- c(techs_to_drop, gen_info.csv$GENERATION_PROJECT[jj]) |>
+      unique()
+  }
+  # Create inputs for RES_storage (drop thermal and H2 techs)
+  gen_build_costs_RES_storage.csv <- gen_build_costs_RES_storage_H2.csv |>
+    filter(!(GENERATION_PROJECT %in% techs_to_drop) | build_year < base_year)
+  f <- fp(switch_dir, "inputs/gen_build_costs_RES_storage.csv")
+  if (fWrt(f)) fwrite(gen_build_costs_RES_storage.csv, f); rm(f)
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--input-aliases", "gen_build_costs.csv=gen_build_costs_RES_storage.csv",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+  # DR_Ref ####
+  # Demand response applied to the Reference case
+  scen_name <- "DR_Ref"
+  message("Creating '", scen_name, "' scenario")
+  flexible_loads <- fread(fp("switch_modules/mcet_modules",
+                             "flexible_loads.csv"))
+  flexible_loads$PERIOD <- base_year
+  f <- fp(switch_dir, "inputs/flexible_loads.csv")
+  if (fWrt(f)) fwrite(flexible_loads,
+                      fp(switch_dir, "inputs", "flexible_loads.csv"))
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+    # "--input-aliases", "gen_build_costs.csv=gen_build_costs_RES_storage.csv",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+
+  # DR_Ref_zonal ####
+  # Demand response by zone applied to the Reference case
+  scen_name <- "DR_Ref_zonal"
+  message("Creating '", scen_name, "' scenario")
+  load_zones.csv <- fread(fp(switch_dir, "inputs/load_zones.csv"))
+  flexible_loads_by_zone_i <- fread(fp("switch_modules/mcet_modules",
+                                       "flexible_loads_by_zone.csv"))[1,]
+  flexible_loads_by_zone_i$PERIOD <- base_year
+
+  flexible_loads_by_zone <- lapply(load_zones.csv$LOAD_ZONE, function(x) {
+    flexible_loads_by_zone_i$ZONES <- x
+    flexible_loads_by_zone_i
+  }) |> rbindlist(); rm(flexible_loads_by_zone_i)
+
+  f <- fp(switch_dir, "inputs/flexible_loads_by_zone.csv")
+  if (fWrt(f)) fwrite(flexible_loads_by_zone,
+                      fp(switch_dir, "inputs", "flexible_loads_by_zone.csv"))
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+    "--input-aliases",
+    # "gen_build_costs.csv=gen_build_costs_RES_storage.csv",
+    "flexible_loads.csv=flexible_loads_by_zone.csv",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+  # DR_RES ####
+  # Demand response applied to the Reference case
+  scen_name <- "DR_RES"
+  message("Creating '", scen_name, "' scenario")
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+    "--input-aliases",
+    "gen_build_costs.csv=gen_build_costs_RES_storage.csv",
+    # "flexible_loads.csv=flexible_loads_by_zone.csv",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+
+  # DR_RES_zonal ####
+  # Demand response applied to the Reference case
+  scen_name <- "DR_RES_zonal"
+  message("Creating '", scen_name, "' scenario")
+  if (fWrt(f_no_tx, append = T)) write_lines(x = paste(
+    glue("# {scen_name} ================================================== #"),
+    "\n",
+    "--scenario-name", scen_name,
+    # "switch -solve",
+    "--inputs-dir", "inputs",
+    "--include-modules", "mcet_modules.dates", "mcet_modules.flexible_loads",
+    "--input-aliases",
+    "gen_build_costs.csv=gen_build_costs_RES_storage.csv",
+    "flexible_loads.csv=flexible_loads_by_zone.csv",
+    "--outputs-dir", glue("outputs-{scen_name}"),
+    "\n"),
+    file = f_no_tx, append = TRUE)
+
+  if (T) {
+    write_lines(c(
+      "call activate switch",
+      # glue("switch solve-scenarios --scenario-file {scenarios_file}"),
+      glue("switch solve-scenarios"),
+      "call conda deactivate",
+      "cmd /k"
+    ), file = fp(switch_dir, "run_scenarios.cmd"))
+  }
+
+}
+
+if (F) {
+  make_mcet_scenarios_queue_1(
+    switch_dir = "scenarios/ISO-test/mod_toy/scen_pypsa_2050_TOL99/switch"
+    )
+}
+
+# ============================================================================= #
 
 
