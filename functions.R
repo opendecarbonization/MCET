@@ -750,4 +750,79 @@ if (F) {
 
 # ============================================================================= #
 
+make_mcet_scenarios_queue_2 <- function(
+  ## Point to the Switch-model directory
+  # switch_dir = "scenarios/ISO-test/mod_toy/scen_pypsa_2050_TOL99/switch",
+  switch_dir,
+  scenarios_file = "scenarios_tx.txt",
+  reference_scenario = "Reference"
+) {
+  # Initiate 'scenarios.txt'
+  scenarios_tx.txt <- c(
+    "# The second set of MCET project scenarios (with transmission constraints).",
+    "# Run the following command to execute scenarios in the queue one by one",
+    glue("# switch solve-scenarios --scenario-file {scenarios_file}"),
+    "# If this doesn't work, rename 'scenarios_tx.txt' to 'scenarios.txt'",
+    glue("# and run switch solve-scenarios"),
+    ""
+  )
+  f_tx <- fp(switch_dir, scenarios_file)
+  if (fWrt(f_no_tx)) write_lines(scenarios_tx.txt, f_tx)
 
+  # add csv-constraints
+  transmission_lines.csv <- fread(fp(switch_dir, "inputs/transmission_lines.csv"))
+  BuildTx.csv <- fread(fp(switch_dir, glue("outputs-{reference_scenario}"),
+                          "BuildTx.csv"))
+
+  ref_BuildTx <- transmission_lines.csv |>
+    select(matches("TRANSMISSION|length")) |>
+    left_join(BuildTx.csv,
+              by = c(TRANSMISSION_LINE = "TRANS_BLD_YRS_1")) |>
+    mutate(MW_km = BuildTx * trans_length_km)
+
+  ref_BuildTx_MW_km <- ref_BuildTx$MW_km |> sum()
+  stopifnot(ref_BuildTx_MW_km > 0)
+
+  for (i in seq(0, .75, by = .25)) {
+    scen_name <- glue("Ref_Tx_{i*100}")
+    message("Creating scenarios {scen_name}")
+    fname <- glue("transmission_limit_mw_km_{i*100}.csv")
+    message(glue("   Writing {fname}"))
+    tx_lim <- data.table(
+      PERIOD = 2050,
+      trans_expansion_limit_mw_km = i * ref_BuildTx_MW_km
+    )
+    fwrite(tx_lim, fp(switch_dir, "inputs", fname))
+    rm(fname, tx_lim)
+
+    if (fWrt(f_tx, append = T)) write_lines(x = paste(
+      glue("# {scen_name} ================================================== #"),
+      "\n",
+      "--scenario-name", scen_name,
+      # "switch -solve",
+      "--inputs-dir", "inputs",
+      "--include-modules", "mcet_modules.new_transmission_limit",
+      "--input-aliases",
+      glue("new_transmission_limit.csv=transmission_limit_mw_km_{i}.csv"),
+      "--outputs-dir", glue("outputs-{scen_name}"),
+      "\n"),
+      file = f_tx, append = TRUE)
+
+  }
+  if (T) {
+    write_lines(c(
+      "call activate switch",
+      glue("switch solve-scenarios --scenario-file {scenarios_file}"),
+      # glue("switch solve-scenarios"),
+      "call conda deactivate",
+      "cmd /k"
+    ), file = fp(switch_dir, "run_scenarios_tx.cmd"))
+  }
+}
+
+
+if (F) {
+  make_mcet_scenarios_queue_2(
+    switch_dir = "scenarios/ISO-test/mod_toy/scen_pypsa_2050_TOL99/switch"
+  )
+}
