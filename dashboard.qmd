@@ -10,14 +10,14 @@ format:
     toc: true
     code-fold: true # when 'echo = true'
 execute:
-  echo: false # should the code be echoed in the output document?
+  echo: false # code echoed in the output document
 params: 
   yaml_path: "config" # file: "{yaml_path}/{mod_shape}/config_{iso3c}.yml
   parquet_dir: "parquet"
   make_parquet: false
-  # iso3c: IND
+  iso3c: IND
   # iso3c: VNM
-  iso3c: THA
+  # iso3c: THA
   mod_shape: null
   mod_ver: null
   model_timezone: UTC
@@ -53,7 +53,10 @@ if (interactive()) {
   handlers("progress")
 }
 
-gis_sf <- rev_get_gisfile(params$iso3c)
+gis_sf <- rev_get_gisfile(params$iso3c) |>
+  rename(load_zone = load_zones) |> # for consistency
+  filter(!offshore)
+  # filter(!grepl("_off", reg_off)) # drop offshore areas
 
 ```
 
@@ -480,8 +483,8 @@ if (F) {
   cap_all$tech_type |> unique()
 }
 
-gis_cap_sf <- full_join(gis_sf, gen_cap_GW, by = c(region = "load_zone"),
-                        relationship = "many-to-many")
+gis_cap_sf <-
+  right_join(gis_sf, gen_cap_GW, by = c(load_zone = "load_zone"))
 
 fig_cap_GW <- ggplot() +
   geom_sf(data = gis_sf) +
@@ -491,13 +494,11 @@ fig_cap_GW <- ggplot() +
   theme_bw() +
   theme_no_ticks()
 
-# ggsave("fig_cap_GW.png", fig_cap_GW,  
-#        path = fp("figures", params$iso3c, unique(gen_cap_GW$mod_shape)[1]), 
+# ggsave("fig_cap_GW.png", fig_cap_GW,
+#        path = fp("figures", params$iso3c, unique(gen_cap_GW$mod_shape)[1]),
 #        width = 8, height = 9,
 #        scale = 1.5)
-
 ```
-
 
 ## Generation
 ```{r, eval=FALSE, echo=FALSE, include=FALSE}
@@ -678,6 +679,15 @@ load_curve <-
   # left_join(all_scenarios) |>
   # select(-scen) |>
   as.data.table()
+
+# lead by year, by zone
+load_yz <- load_curve |>
+  mutate(YEAR = year(datetime)) |>
+  group_by(iso3c, mod_shape, mod_ver, YEAR, load_zone) |>
+  summarise(zone_demand_GWh = sum(zone_demand_mw) / 1e3, .groups = "drop")
+# total load in 2050
+load_2050 <- load_yz |> filter(YEAR == 2050) |> pull(zone_demand_GWh) |>
+  sum(na.rm = T)
   
 load_curve |>
   # group_by(iso3c, mod_shape, mod_ver, load_zone, YDAY, HOUR) |>
@@ -703,7 +713,6 @@ load_curve |>
   facet_wrap(~load_zone, scales = "free_y") +
   theme_mcet() 
 ```
-
 
 ### Flexible, daily
 ```{r flex_load_daily, fig.height=8, fig.cap="Daily shiftable load"}
@@ -736,7 +745,6 @@ flex_load_daily |>
   theme_mcet() 
 
 ```
-
 
 ### Flexible, annual
 ```{r flex_load_annual, fig.height=8, fig.cap="Daily shiftable load"}
@@ -771,7 +779,7 @@ flex_load_annual |>
 ```
 
 ### Flexible, allocation
-```{r flex_load_alloc, fig.height=8, fig.cap="Shiftable load allocation, %"}
+```{r flex_load_alloc, fig.height=8, fig.cap="Shiftable load allocation, % of load"}
 flex_baseload_alloc <- 
   get_table("FlexibleBaseloadZoneAllocation.csv") |>
   rename(fl_zones = 1, period = 2, load_zone = 3,
@@ -810,7 +818,14 @@ flex_annual_alloc <-
   as.data.table()
 
 flex_alloc <- rbindlist(
-  list(flex_baseload_alloc, flex_daily_alloc, flex_annual_alloc))
+  list(flex_baseload_alloc, flex_daily_alloc, flex_annual_alloc)) |>
+  # calculate total load
+  left_join(load_yz) |>
+  mutate(allocation_GWh = allocation * if_else(fl_zones == "all", 
+                                               load_2050, 
+                                               zone_demand_GWh),
+         allocation_adj = allocation_GWh / zone_demand_GWh,
+         .after = "zone_demand_GWh")
   
 gis_flex_sf <- full_join(gis_sf, flex_alloc, 
                          by = c(region = "load_zone"),
@@ -819,8 +834,9 @@ gis_flex_sf <- full_join(gis_sf, flex_alloc,
 fig_flex_share <-
   ggplot() +
   geom_sf(data = gis_sf) +
-  geom_sf(aes(fill = 100 * allocation), data = gis_flex_sf) +
-  scale_fill_viridis_c(option = "H", name = "%") +
+  geom_sf(aes(fill = 100 * allocation_adj), data = gis_flex_sf) +
+  scale_fill_viridis_c(option = "H", name = "%", transform = "sqrt",
+                       limits = c(1, NA)) +
   facet_grid(scenario~flex_load_type) +
   theme_bw() +
   theme_no_ticks()
@@ -829,22 +845,12 @@ fig_flex_share
 ```
 
 ```{r flex_load_alloc_gwh, fig.height=8, fig.cap="Shiftable load allocation, TWh"}
-loads_y <- load_curve |>
-  mutate(YEAR = year(datetime)) |>
-  group_by(iso3c, mod_shape, mod_ver, YEAR, load_zone) |>
-  summarise(zone_demand_GWh = sum(zone_demand_mw) / 1e3, .groups = "drop")
-
-gis_flex_gwh_sf <- gis_flex_sf |>
-  rename(load_zone = load_zones) |>
-  left_join(loads_y) |>
-  mutate(allocation_GWh = allocation * zone_demand_GWh, 
-         .after = "zone_demand_GWh")
 
 fig_flex_TWh <-
   ggplot() +
   geom_sf(data = gis_sf) +
-  geom_sf(aes(fill = allocation_GWh/1e3), data = gis_flex_gwh_sf) +
-  scale_fill_viridis_c(option = "H", name = "TWh") +
+  geom_sf(aes(fill = allocation_GWh/1e3), data = gis_flex_sf) +
+  scale_fill_viridis_c(option = "H", name = "TWh", transform = "sqrt") +
   facet_grid(scenario~flex_load_type) +
   theme_bw() +
   theme_no_ticks()
