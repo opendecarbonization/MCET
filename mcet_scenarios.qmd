@@ -25,9 +25,9 @@ params:
   # iso3c: CHL
   # iso3c: CHN
   # iso3c: COL
-  # iso3c: IND 
+  iso3c: IND
   # iso3c: KAZ
-  iso3c: MYS
+  # iso3c: MYS
   # iso3c: THA
   # iso3c: VNM
   yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
@@ -365,7 +365,7 @@ if (params$RES_drop_thermal_techs) {
     filter(GENERATION_PROJECT %in% inp2$gen_info.csv$GENERATION_PROJECT)
 } else {
   # prevent investment in thermal generation
-  noinv_techs <- "_(ELIG|EOIL|EGAS|ECOA|ENUC)" # mask to drop techs
+  noinv_techs <- "_(ELIG|EOIL|EGAS|ECOA|ENUC|ECCG|CCS)" # mask to drop techs
   inp2 <- inp
   inp2$gen_build_costs.csv <- inp$gen_build_costs.csv |>
     filter(!grepl(noinv_techs, GENERATION_PROJECT) | build_year < 2050)

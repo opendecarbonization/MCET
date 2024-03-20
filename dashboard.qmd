@@ -1,0 +1,1042 @@
+---
+title: "MCET scenarios dashboard"
+author: "Multi-Country Electricity Transition Potential and Challenges"
+date:  "`r Sys.Date()`"
+format: 
+  # pdf:
+  html:
+    fig-width: 6.5
+    fig-height: 5
+    toc: true
+    code-fold: true # when 'echo = true'
+execute:
+  echo: false # should the code be echoed in the output document?
+params: 
+  yaml_path: "config" # file: "{yaml_path}/{mod_shape}/config_{iso3c}.yml
+  parquet_dir: "parquet"
+  make_parquet: false
+  # iso3c: IND
+  # iso3c: VNM
+  iso3c: THA
+  mod_shape: null
+  mod_ver: null
+  model_timezone: UTC
+  convert_timezone: true
+editor_options: 
+  chunk_output_type: console
+---
+
+## Setup
+<!-- The directory with MCET/Switch model results:  -->
+```{r setup, warning=FALSE, echo=FALSE, message=FALSE}
+# cat(params$parquet_dir)
+library(here)
+setwd(here())
+source("functions.R")
+stopifnot(mcet_check_installations())
+library("sf")
+require("tidyverse", warn.conflicts = F)
+require("data.table", warn.conflicts = F)
+require("glue", warn.conflicts = F)
+require("arrow", warn.conflicts = F)
+library("dbplyr", warn.conflicts = FALSE)
+library("dtplyr")
+library("duckdb", warn.conflicts = F)
+library("progressr")
+fp <- file.path
+
+# Set country
+rev_set_country(params$iso3c)
+# rev_country()
+if (interactive()) {
+  progressr::handlers(global = TRUE)
+  handlers("progress")
+}
+
+gis_sf <- rev_get_gisfile(params$iso3c)
+
+```
+
+```{r make_parquet, eval=FALSE}
+# build / update database 
+switch_to_parquet(
+  iso3c = params$iso3c,
+  # iso3c = c("VNM", "THA"),
+  save_path = params$parquet_dir
+  )
+
+```
+
+## Functions
+```{r functions, echo=FALSE, include=FALSE}
+# list imported files (grouped into directories)
+fls <- lapply(
+  fp(params$parquet_dir, c("", "inputs", "outputs")),
+  # fp(params$parquet_dir, c("outputs")),
+  function(x) list.dirs(x, full.names = T, recursive = F)
+) |> unlist()
+
+get_table <- function(name = "timepoints.csv", 
+                      filter_iso3c = params$iso3c,
+                      filter_mod_shape = params$mod_shape,
+                      filter_mod_ver = params$mod_ver
+                      ) {
+  # browser()
+  ii <- grepl(name, fls)
+  if (sum(ii) < 1) {
+    message("Table not found: ", name)
+    return(invisible())
+  }
+  if (sum(ii) > 1) {
+    message("Two or more tables matches this pattern:")
+    cat(fls[ii], sep = "\n")
+    return(invisible())
+  }
+  d <- open_dataset(fls[ii])
+  if (!is.null(filter_iso3c)) d <- filter(d, iso3c %in% filter_iso3c)
+  if (!is.null(filter_mod_shape)) d <- filter(d, mod_shape %in% filter_mod_shape)
+  if (!is.null(filter_mod_ver)) d <- filter(d, mod_ver %in% filter_mod_ver)
+  return(d)
+}
+basename(fls)
+# get_table("timepoints") |> collect()
+
+collect_scenarios <- function() {
+  get_table("gen_cap.csv") |> # any table from 'outputs'
+    # head() |>
+    select(scen) |>
+    unique() |>
+    as.data.table()
+}
+
+rename_scenarios <- function(x) {
+  # rename scen -> scenario
+  s <- "scenario"
+  if (is.null(x[[s]])) {
+    if (is.null(x[["scen"]])) stop("'senario' or 'scen' column does not exist")
+    x <- mutate(x, scenario = scen, .before = "scen")
+  }
+  if (is.factor(x[[s]])) x[[s]] <- as.character(x[[s]])
+  x$scenario |> unique()
+  # x <-
+  x |>
+    mutate(
+      # No policy
+      scenario = if_else(grepl("^No.policy$", scenario, ignore.case = T),
+        "No Policy", scenario
+      ),
+      # Reference
+      scenario = if_else(grepl("^Reference$", scenario, ignore.case = T),
+        "Reference", scenario
+      ),
+      # RES_storage_H2
+      scenario = if_else(grepl("^RES.stor.+H2$", scenario, ignore.case = T),
+        "RES & Storage & H2", scenario
+      ),
+      # RES_storage
+      scenario = if_else(grepl("^RES.storage$", scenario, ignore.case = T),
+        "RES & Storage", scenario
+      ),
+      # Tx_75
+      scenario = if_else(grepl("Tx.75", scenario, ignore.case = T),
+        "Ref. Tx 75%", scenario
+      ),
+      # Tx_50
+      scenario = if_else(grepl("Tx.50", scenario, ignore.case = T),
+        "Ref. Tx 50%", scenario
+      ),
+      # Tx_25
+      scenario = if_else(grepl("Tx.25", scenario, ignore.case = T),
+        "Ref. Tx 25%", scenario
+      ),
+      # Tx_0
+      scenario = if_else(grepl("Tx.0", scenario, ignore.case = T),
+        "Ref. Tx 0%", scenario
+      ),
+      # DR_1
+      scenario = if_else(grepl("DR.1", scenario, ignore.case = T),
+        "Ref. DR", scenario
+      ),
+      # DR_2
+      scenario = if_else(grepl("DR.2", scenario, ignore.case = T),
+        "Ref. DR-X", scenario
+      ),
+      # DR_3
+      scenario = if_else(grepl("DR.3", scenario, ignore.case = T),
+        "RES DR", scenario
+      ),
+      # DR_4
+      scenario = if_else(grepl("DR.4", scenario, ignore.case = T),
+        "RES DR-X", scenario
+      ),
+      scenario = factor(scenario, ordered = TRUE, levels = c(
+        "No Policy", "Reference", 
+        "RES & Storage & H2", "RES & Storage",
+        "Ref. Tx 75%", "Ref. Tx 50%", "Ref. Tx 25%", "Ref. Tx 0%",
+        "Ref. DR", "Ref. DR-X", 
+        "RES DR", "RES DR-X"
+      ))
+    ) |>
+    arrange(scenario)
+}
+
+add_tech_type <- function(x 
+                          # tech_type = "tech_type",
+                          # gen_tech = "gen_tech",
+                          # gen_energy_source = "gen_energy_source"
+                          ) {
+  # browser()
+  if (is.null(x[["gen_tech"]])) {
+    warning("Column '", "gen_tech", "' does not exist")
+    return(x)
+  }
+  if (is.null(x[["gen_energy_source"]])) {
+    warning("Column '", "gen_energy_source", "' does not exist")
+    return(x)
+  }
+  # x$gen_tech |> unique()
+  x |>
+    mutate(
+      # Initiate
+      # {{ tech_type }} := gen_tech,
+      tech_type = gen_tech,
+      # Coal
+      tech_type = if_else(
+        grepl("^COA|LIG$", gen_energy_source, ignore.case = T),
+        "Coals", tech_type
+      ),
+      # Gas
+      tech_type = if_else(
+        grepl("^GAS$", gen_energy_source, ignore.case = T),
+        "Gas", tech_type
+      ),
+     # Oil
+      tech_type = if_else(
+        grepl("^OIL$", gen_energy_source, ignore.case = T),
+        "Oil", tech_type
+      ),
+      # Wind
+      tech_type = if_else(
+        grepl("^WIN$", gen_energy_source, ignore.case = T),
+        "Wind", tech_type
+      ),
+      # Solar
+      tech_type = if_else(
+        grepl("^SOL$", gen_energy_source, ignore.case = T),
+        "Solar", tech_type
+      ),
+     # Biomass
+      tech_type = if_else(
+        grepl("^BIO$", gen_energy_source, ignore.case = T),
+        "Biomass", tech_type
+      ),
+      # Hydro
+      tech_type = if_else(
+        grepl("^(HYD|ROR)$", gen_energy_source, ignore.case = T),
+        "Hydro", tech_type
+      ),
+      # Nuclear
+      tech_type = if_else(
+        grepl("^NUC$", gen_energy_source, ignore.case = T),
+        "Nuclear", tech_type
+      ),
+      # Battery
+      tech_type = if_else(
+        grepl("^Electricity$", gen_energy_source, ignore.case = T) &
+          grepl("^STG_BTR$", gen_tech, ignore.case = T),
+        "Battery", tech_type
+      ),
+      # Battery
+      tech_type = if_else(
+        grepl("^PHS$", gen_energy_source, ignore.case = T),
+          # grepl("^STG_PHS$", gen_tech, ignore.case = T),
+        "Pumped Hydro", tech_type
+      ),
+      # Battery
+      tech_type = if_else(
+        grepl("^Electricity$", gen_energy_source, ignore.case = T) &
+          grepl("^STG_H2$", gen_tech, ignore.case = T),
+        "H2 (P2P)", tech_type
+      ),
+      # CCS
+      tech_type = if_else(
+        grepl("_CCS$", gen_energy_source),
+        "CCS", tech_type
+      ),
+     # Order names
+      tech_type = factor(tech_type, ordered = TRUE, levels = rev(c(
+        "Coals", "Gas", "Oil", "CCS", 
+        "Nuclear", "Hydro",
+        "Biomass", "Solar", "Wind", 
+        "Battery", "H2 (P2P)", "Pumped Hydro",
+        "Transmission", "Unserved", "Curtailed"
+        # unique(x$gen_tech)
+      )))
+    )
+}
+
+
+
+timepoint_to_datetime <- function(x) {
+  # x - character vector with timepoints
+  YEAR <- str_extract(x, pattern = "^([^_]*)") |> as.integer()
+  # x <- str_replace(x, "^2[0-9]+_", "")
+  YDAY <- str_extract(x, "(?<=d)\\d+(?=_h)") |> as.integer()
+  HOUR <- str_extract(x, "(?<=h)\\d+$") |> as.integer()
+  dtm <- 
+    lubridate::make_datetime(year = YEAR, month = 1, day = 1, hour = HOUR) + 
+    lubridate::days(YDAY - 1)
+  dtm
+}
+
+timepoint_to_year <- function(x) {
+  str_extract(x, pattern = "^([^_]*)") |> as.integer()
+}
+
+timepoint_to_yday <- function(x) {
+  str_extract(x, "(?<=d)\\d+(?=_h)") |> as.integer()
+}
+
+timepoint_to_hour <- function(x) {
+  str_extract(x, "(?<=h)\\d+$") |> as.integer()
+}
+
+collect_timepoints <- function() {
+  get_table("timepoints.csv") |>
+    # head() |>
+    select(timepoint_id) |>
+    unique() |>
+    as.data.table() |>
+    rename(timepoint = 1) |>
+    mutate(
+      datetime = timepoint_to_datetime(timepoint),
+      MONTH = lubridate::month(datetime),
+      YDAY = timepoint_to_yday(timepoint),
+      HOUR = timepoint_to_hour(timepoint),
+      WEEK = ceiling(YDAY / 7)
+    ) |>
+    collect()
+}
+
+add_datetime <- function(x, 
+                         columns = c("datetime", 
+                                     "MONTH", "WEEK", 
+                                     "YDAY", "HOUR"),
+                         replace_x_columns = TRUE) {
+  if (!exists("all_timepoints")) all_timepoints <- collect_timepoints()
+  if (replace_x_columns) {
+    x <- select(x, -any_of(columns))
+  }
+  x |> left_join(
+    select(all_timepoints, timepoint, all_of(columns))
+  )
+}
+
+add_season <- function(x) {
+  x |>
+    mutate(
+      season = "",
+      season = if_else(MONTH %in% c(1, 2, 12), "Winter", season),
+      season = if_else(MONTH %in% c(3:5), "Spring", season),
+      season = if_else(MONTH %in% c(6:8), "Summer", season),
+      season = if_else(MONTH %in% c(9:11), "Fall", season),
+      season = factor(season, labels = c("Winter", "Spring", "Summer", "Fall"),
+                      ordered = TRUE)
+      )
+}
+
+collect_projects <- function() {
+  x <- get_table("gen_info.csv") |>
+    # head() |>
+    rename(
+      load_zone = gen_load_zone
+    ) |>
+    select(GENERATION_PROJECT, gen_tech, load_zone, 
+           gen_energy_source, gen_is_variable
+           # iso3c, mod_shape, mod_ver
+           ) |>
+    unique()
+  x |> as.data.table()
+}
+
+collect_transmission <- function() {
+  get_table("transmission_lines.csv") |>
+    # head() |>
+    select(TRANSMISSION_LINE, trans_lz1, trans_lz2) |>
+    unique() |> as.data.table()
+}
+
+if (F) {
+  collect_projects()
+  collect_transmission()
+  
+  # all timpoints existing in the database
+  get_table("timepoints.csv") |>
+    head() |>
+    collect()
+
+  timepoint_to_datetime("2050_d149_h16")
+  timepoint_to_year("2050_d149_h16")
+  timepoint_to_yday("2050_d149_h16")
+  timepoint_to_hour("2050_d149_h16")
+}
+
+theme_mcet <- function() {
+  theme_bw() +
+    theme(axis.text.x = element_text(
+      angle = 55,
+      # vjust = 0.5,
+      hjust = 1
+    ))
+}
+
+```
+
+## Sets
+```{r sets}
+# Import time schedules, projects and fuels information, and build mapping datasets to use in figures and tables. 
+
+# scenarios
+all_scenarios <- collect_scenarios() |>
+  rename_scenarios()
+
+# timepoints
+all_timepoints <- collect_timepoints()
+
+# generation projects
+all_projects <- collect_projects() |>
+  add_tech_type()
+
+all_project_types <- all_projects |>
+  select(GENERATION_PROJECT, gen_tech, tech_type) |> unique()
+
+# transmission
+all_transmission <- collect_transmission() |>
+  mutate(tech_type = "Transmission")
+
+# (including storage and transmission)
+
+# variable capacity factors (to estimate curtailed energy)
+variable_capacity_factors <- get_table("variable_capacity_factors.csv")
+if (!is.null(params$iso3c)) {
+  variable_capacity_factors <- variable_capacity_factors |>
+    filter(iso3c %in% params$iso3c)
+}
+# variable_capacity_factors |> as.data.table()
+
+# GIS
+
+```
+
+## Figures (`r params$iso3c`)
+
+## Capacity
+```{r capacity, fig.height=8}
+gen_cap_GW <- get_table("gen_cap.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  rename(load_zone = gen_load_zone) |>
+  group_by(iso3c, mod_shape, mod_ver, scen, PERIOD, load_zone,
+           gen_tech, gen_energy_source) |>
+  summarise(
+    GW = sum(GenCapacity, na.rm = T) / 1e3,
+    GWh = sum(GenStorageCapacity, na.rm = T) / 1e3,
+    .groups = "drop"
+  ) |>
+  collect() |> 
+  # ungroup() |>
+  rename_scenarios() |>
+  # select(-any_of("scen")) |>
+  add_tech_type() |>
+  pivot_longer(cols = c("GW", "GWh"), names_to = "unit") |>
+  as.data.table()
+
+transmission_GW <- get_table("transmission.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  collect() |>
+  rename_scenarios() |>
+  group_by(iso3c, mod_shape, mod_ver, scenario, PERIOD) |>
+  summarise(`GW*1000km` = sum(TxCapacityNameplate * trans_length_km) / 1e6,
+            .groups = "drop") |>
+  pivot_longer(cols = `GW*1000km`, names_to = "unit") |>
+  mutate(tech_type = "Transmission") |>
+  as.data.table()
+
+cap_all <- rbindlist(list(gen_cap_GW, transmission_GW), use.names = T, fill = T)
+
+ggplot(cap_all) +
+  geom_bar(aes(scenario, value, fill = tech_type),
+    stat = "identity"
+  ) +
+  scale_fill_viridis_d(option = "H", name = "Tech. type") +
+  facet_grid(unit~PERIOD, scales = "free_y") +
+  theme_mcet() +
+  labs(y = "Total capacity", x = "")
+
+```
+
+### Maps
+```{r fig_cap_GW, fig.height=8, fig.retina=TRUE}
+if (F) {
+  cap_all$tech_type |> unique()
+}
+
+gis_cap_sf <- full_join(gis_sf, gen_cap_GW, by = c(region = "load_zone"),
+                        relationship = "many-to-many")
+
+fig_cap_GW <- ggplot() +
+  geom_sf(data = gis_sf) +
+  geom_sf(aes(fill = value), data = filter(gis_cap_sf, unit == "GW")) +
+  scale_fill_viridis_c(option = "H", name = "GW", transform = "pseudo_log") +
+  facet_grid(tech_type~scenario) +
+  theme_bw() +
+  theme_no_ticks()
+
+# ggsave("fig_cap_GW.png", fig_cap_GW,  
+#        path = fp("figures", params$iso3c, unique(gen_cap_GW$mod_shape)[1]), 
+#        width = 8, height = 9,
+#        scale = 1.5)
+
+```
+
+
+## Generation
+```{r, eval=FALSE, echo=FALSE, include=FALSE}
+# !!! unfinished
+get_table("/dispatch_wide.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+dispatch_annual <- get_table("dispatch_annual_summary.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  collect() |>
+  rename_scenarios() |>
+  add_tech_type() |>
+  group_by(iso3c, mod_shape, mod_ver, scenario, period, tech_type) |>
+  summarise(GWh = sum(Energy_GWh_typical_yr, na.rm = T) / 1e3,
+            # LCOE = weighted.mean(LCOE_dollar_per_MWh, 
+            #                      w = abs(Discharge_GWh_typical_yr)),
+            .groups = "drop") |>
+  as.data.table()
+
+if (F) {
+  get_table("UnservedLoad.csv") |>
+    filter(iso3c %in% params$iso3c) |>
+    filter(UnservedLoad > 1) |>
+    collect() |>
+    pull(UnservedLoad) |>
+    summary()
+}
+
+unserved_load <- get_table("UnservedLoad.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  filter(UnservedLoad > 1) |>
+  group_by(iso3c, mod_shape, mod_ver, scen) |>
+  summarise(GWh = sum(round(UnservedLoad / 1e3, 3), na.rm = T),
+            .groups = "drop") |>
+  mutate(tech_type = "Unserved") |>
+  collect() |>
+  rename_scenarios() |>
+  select(-any_of("scen")) |>
+  as.data.table()
+
+dispatch_y <- rbindlist(list(dispatch_annual, unserved_load), 
+                        use.names = T, fill = T)
+
+ggplot(dispatch_y) +
+  geom_bar(aes(scenario, GWh, fill = tech_type), stat = "identity") +
+  scale_fill_viridis_d(option = "H", name = "Tech. type") +
+  # facet_grid(unit~PERIOD, scales = "free_y") +
+  theme_mcet() +
+  labs(y = "Total Generation, GWh", x = "")
+
+```
+
+## Electricity costs
+```{r, eval=T}
+# ggplot(dispatch_annual) +
+#   geom_bar(aes(scenario, LCOE, fill = tech_type), stat = "identity") +
+#   scale_fill_viridis_d(option = "H", name = "Tech. type") +
+#   # facet_grid(unit~PERIOD, scales = "free_y") +
+#   theme_mcet() +
+#   labs(y = "Total Generation, GWh", x = "")
+
+electricity_cost <- get_table("electricity_cost.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  collect() |>
+  rename_scenarios() |>
+  # add_tech_type() |>
+  as.data.table()
+
+ggplot(electricity_cost) +
+  geom_bar(aes(scenario, EnergyCostReal_per_MWh), stat = "identity",
+           fill = "dodgerblue") +
+  # scale_fill_viridis_d(option = "H", name = "Tech. type") +
+  # facet_grid(unit~PERIOD, scales = "free_y") +
+  theme_mcet() +
+  labs(y = "EnergyCostReal_per_MWh", x = "")
+
+  # group_by(iso3c, mod_shape, mod_ver, scenario, period, tech_type) |>
+  # summarise(GWh = sum(Energy_GWh_typical_yr, na.rm = T) / 1e3,
+  #           LCOE = weighted.mean(LCOE_dollar_per_MWh, 
+  #                                w = abs(Discharge_GWh_typical_yr)),
+  #           .groups = "drop") |>
+  # as.data.table()
+
+```
+
+## Unserved load
+```{r unserved, fig.height=8, warning=F}
+unserved_load <-
+  get_table("UnservedLoad.csv") |>
+  rename(load_zone = 1, timepoint = 2, value = UnservedLoad) |>
+  filter(value > 1) |>
+  mutate(name = "Unserved") |>
+  mutate(tech_type = name) |>
+  left_join(all_scenarios) |>
+  left_join(all_timepoints) |>
+  select(-any_of("scen")) |>
+  as.data.table()
+
+unserved_load |>
+  group_by(iso3c, mod_shape, mod_ver, scenario, YDAY, HOUR) |>
+  summarise(GWh = sum(value, na.rm = T) / 1e3, .groups = "drop") |>
+  # right_join(all_timepoints) |>
+  # complete(
+  #   iso3c, mod_shape, mod_ver, scenario, YDAY, HOUR,
+  #   fill = list(GWh = 0)) |>
+  ggplot() +
+  geom_raster(aes(YDAY, HOUR, fill = GWh)) +
+  scale_fill_viridis_c(option = "H", name = "GWh", na.value = "#30123BFF") +
+  facet_wrap(~scenario) +
+  theme_mcet() 
+  # theme(
+  #   panel.background = element_rect(fill = "lightgrey"),
+  #   panel.grid.major = element_line(color = NA),
+  #   panel.grid.minor = element_line(color = NA)
+  #   )
+
+```
+
+## Curtailed generation (VER)
+```{r curtailed, fig.height=8}
+# Variable energy sources only
+curtailed_generation <-
+  get_table("DispatchGen.csv") |>
+  rename(GENERATION_PROJECT = 1, timepoint = 2) |>
+  left_join(variable_capacity_factors) |>
+  filter(!is.na(gen_max_capacity_factor)) |>
+  left_join(
+    select(
+      get_table("gen_cap.csv"), 
+      GENERATION_PROJECT, GenCapacity, iso3c, 
+      mod_shape, mod_ver, scen)
+  ) |>
+  mutate(
+    name = "Curtailed",
+    value = round(GenCapacity * gen_max_capacity_factor - DispatchGen, 1)) |>
+  filter(value > 0) |>
+  left_join(all_scenarios) |>
+  left_join(select(all_projects, GENERATION_PROJECT, load_zone)) |>
+  select(iso3c, mod_shape, mod_ver, scenario, load_zone, GENERATION_PROJECT, 
+         timepoint, name, value) |>
+  add_datetime() |>
+  mutate(tech_type = name) |>
+  # head() |>
+  as.data.table()
+
+curtailed_generation |>
+  group_by(iso3c, mod_shape, mod_ver, scenario, YDAY, HOUR) |>
+  summarise(GWh = sum(value, na.rm = T) / 1e3, .groups = "drop") |>
+  complete(
+    iso3c, mod_shape, mod_ver, scenario, YDAY, HOUR,
+    fill = list(GWh = NA)) |>
+  ggplot() +
+  geom_raster(aes(YDAY, HOUR, fill = GWh)) +
+  scale_fill_viridis_c(option = "H", name = "GWh", na.value = "#30123BFF") +
+  facet_wrap(~scenario) +
+  theme_mcet() 
+  # theme(
+  #   panel.background = element_rect(fill = "#30123BFF"),
+  #   panel.grid.major = element_line(color = NA),
+  #   panel.grid.minor = element_line(color = NA)
+  #   )
+
+```
+
+## Loads
+
+### Exogenous
+```{r loads, fig.height=8}
+load_curve <-
+  get_table("inputs/loads.csv") |>
+  rename(load_zone = LOAD_ZONE, timepoint = TIMEPOINT) |>
+  left_join(all_timepoints) |>
+  # select(-any_of())
+  unique() |>
+  # left_join(all_scenarios) |>
+  # select(-scen) |>
+  as.data.table()
+  
+load_curve |>
+  # group_by(iso3c, mod_shape, mod_ver, load_zone, YDAY, HOUR) |>
+  # summarise(GWh = sum(zone_demand_mw, na.rm = T) / 1e3, .groups = "drop") |>
+  # complete(
+  #   iso3c, mod_shape, mod_ver, scenario, YDAY, HOUR,
+  #   fill = list(GWh = NA)) |>
+  ggplot() +
+  geom_raster(aes(YDAY, HOUR, fill = zone_demand_mw/1e3)) +
+  scale_fill_viridis_c(option = "H", name = "GWh", na.value = "#30123BFF") +
+  facet_wrap(~load_zone, scales = "free_y") +
+  theme_mcet() 
+
+load_curve |>
+  # group_by(iso3c, mod_shape, mod_ver, load_zone, YDAY, HOUR) |>
+  # summarise(GWh = sum(zone_demand_mw, na.rm = T) / 1e3, .groups = "drop") |>
+  # complete(
+  #   iso3c, mod_shape, mod_ver, scenario, YDAY, HOUR,
+  #   fill = list(GWh = NA)) |>
+  ggplot() +
+  geom_line(aes(HOUR, zone_demand_mw/1e3, color = YDAY, group = YDAY)) +
+  scale_color_viridis_c(option = "H", name = "YDAY") +
+  facet_wrap(~load_zone, scales = "free_y") +
+  theme_mcet() 
+```
+
+
+### Flexible, daily
+```{r flex_load_daily, fig.height=8, fig.cap="Daily shiftable load"}
+flex_load_daily <- 
+  get_table("FlexibleLoadDailyShiftable.csv") |>
+  rename(fl_zones = 1, load_zone = 2, timepoint = 3,
+         flext_load_daily = FlexibleLoadDailyShiftable) |>
+  left_join(all_timepoints) |>
+  # select(-any_of())
+  unique() |>
+  mutate(flext_load_daily = round(flext_load_daily, 1)) |>
+  left_join(all_scenarios) |>
+  select(-scen) |>
+  as.data.table()
+
+if (F) {
+  flex_load_daily$flext_load_daily |> summary()
+  flex_load_daily$scenario |> unique()
+}
+
+flex_load_daily |>
+  filter(flext_load_daily > 0) |>
+  ggplot() +
+  geom_raster(aes(YDAY, HOUR, fill = flext_load_daily/1e3)) +
+  scale_fill_viridis_c(option = "H", 
+                       na.value = "#30123BFF",
+                       transform = "log10", limits = c(1, NA),
+                       name = "GWh") +
+  facet_grid(load_zone~scenario) +
+  theme_mcet() 
+
+```
+
+
+### Flexible, annual
+```{r flex_load_annual, fig.height=8, fig.cap="Daily shiftable load"}
+flex_load_annual <- 
+  get_table("FlexibleLoadAnnualShiftable.csv") |>
+  rename(fl_zones = 1, load_zone = 2, timepoint = 3,
+         flex_load_annual = FlexibleLoadAnnualShiftable) |>
+  left_join(all_timepoints) |>
+  # select(-any_of())
+  unique() |>
+  mutate(flex_load_annual = round(flex_load_annual, 1)) |>
+  left_join(all_scenarios) |>
+  select(-scen) |>
+  as.data.table()
+
+if (F) {
+  flex_load_annual$flex_load_annual |> summary()
+  flex_load_annual$scenario |> unique()
+}
+
+flex_load_annual |>
+  filter(flex_load_annual > 0) |>
+  ggplot() +
+  geom_raster(aes(YDAY, HOUR, fill = flex_load_annual/1e3)) +
+  scale_fill_viridis_c(option = "H", 
+                       na.value = "#30123BFF",
+                       transform = "log10", limits = c(1, NA),
+                       name = "GWh") +
+  facet_grid(load_zone~scenario) +
+  theme_mcet() 
+
+```
+
+### Flexible, allocation
+```{r flex_load_alloc, fig.height=8, fig.cap="Shiftable load allocation, %"}
+flex_baseload_alloc <- 
+  get_table("FlexibleBaseloadZoneAllocation.csv") |>
+  rename(fl_zones = 1, period = 2, load_zone = 3,
+         allocation = FlexibleBaseloadZoneAllocation) |>
+  # left_join(all_timepoints) |>
+  unique() |>
+  left_join(all_scenarios) |>
+  select(-scen) |>
+  mutate(flex_load_type = "Baseload", .before = "allocation") |>
+  as.data.table()
+
+flex_daily_alloc <- 
+  get_table("FlexibleDailyShiftableZoneAllocation.csv") |>
+  rename(fl_zones = 1, period = 2, load_zone = 3,
+         allocation = FlexibleDailyShiftableZoneAllocation) |>
+  # left_join(all_timepoints) |>
+  # select(-any_of())
+  unique() |>
+  # mutate(flex_load_annual = round(flex_load_annual, 1)) |>
+  left_join(all_scenarios) |>
+  select(-scen) |>
+  mutate(flex_load_type = "Daily Shift", .before = "allocation") |>
+  as.data.table()
+
+flex_annual_alloc <- 
+  get_table("FlexibleAnnualShiftableZoneAllocation.csv") |>
+  rename(fl_zones = 1, period = 2, load_zone = 3,
+         allocation = FlexibleAnnualShiftableZoneAllocation) |>
+  # left_join(all_timepoints) |>
+  # select(-any_of())
+  unique() |>
+  # mutate(flex_load_annual = round(flex_load_annual, 1)) |>
+  left_join(all_scenarios) |>
+  mutate(flex_load_type = "Annual Shift", .before = "allocation") |>
+  select(-scen) |>
+  as.data.table()
+
+flex_alloc <- rbindlist(
+  list(flex_baseload_alloc, flex_daily_alloc, flex_annual_alloc))
+  
+gis_flex_sf <- full_join(gis_sf, flex_alloc, 
+                         by = c(region = "load_zone"),
+                         relationship = "many-to-many")
+
+fig_flex_share <-
+  ggplot() +
+  geom_sf(data = gis_sf) +
+  geom_sf(aes(fill = 100 * allocation), data = gis_flex_sf) +
+  scale_fill_viridis_c(option = "H", name = "%") +
+  facet_grid(scenario~flex_load_type) +
+  theme_bw() +
+  theme_no_ticks()
+
+fig_flex_share
+```
+
+```{r flex_load_alloc_gwh, fig.height=8, fig.cap="Shiftable load allocation, TWh"}
+loads_y <- load_curve |>
+  mutate(YEAR = year(datetime)) |>
+  group_by(iso3c, mod_shape, mod_ver, YEAR, load_zone) |>
+  summarise(zone_demand_GWh = sum(zone_demand_mw) / 1e3, .groups = "drop")
+
+gis_flex_gwh_sf <- gis_flex_sf |>
+  rename(load_zone = load_zones) |>
+  left_join(loads_y) |>
+  mutate(allocation_GWh = allocation * zone_demand_GWh, 
+         .after = "zone_demand_GWh")
+
+fig_flex_TWh <-
+  ggplot() +
+  geom_sf(data = gis_sf) +
+  geom_sf(aes(fill = allocation_GWh/1e3), data = gis_flex_gwh_sf) +
+  scale_fill_viridis_c(option = "H", name = "TWh") +
+  facet_grid(scenario~flex_load_type) +
+  theme_bw() +
+  theme_no_ticks()
+
+fig_flex_TWh
+
+```
+
+
+
+## Dispatch
+```{r, eval=FALSE}
+# dispatch tables: run one-by-one for a quick-look
+
+get_table("/dispatch.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+get_table("/dispatch_annual_summary.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+get_table("/dispatch_wide.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+get_table("/dispatch_zonal_annual_summary.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+# get_table("/dispatch_zonal_annual_summary.csv") |>
+#   filter(iso3c %in% params$iso3c) |>
+#   select(scen) |>
+#   unique() |>
+#   collect()
+
+get_table("DispatchGen.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+get_table("storage_dispatch.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+get_table("DispatchTx.csv") |>
+  filter(iso3c %in% params$iso3c) |>
+  head() |>
+  collect() |>
+  as.data.table()
+
+```
+
+### By region
+```{r, dispatch_by_reg_h, fig.height=8, message=FALSE, warning=FALSE}
+# Generation
+generation_dispatch <-
+  get_table("DispatchGen.csv") |>
+  rename(GENERATION_PROJECT = 1, timepoint = 2) |>
+  left_join(
+    select(all_projects, -any_of(c("gen_is_variable")))
+  ) |>
+  left_join(all_timepoints) |>
+  left_join(all_scenarios) |>
+  select(-any_of("scen")) |>
+  mutate(
+    # name = "Generation", 
+    name = tech_type, 
+    .before = "DispatchGen") |>
+  rename(value = DispatchGen) |>
+  mutate(value  = round(value, 2)) |>
+  as.data.table()
+
+# Storage
+storage_dispatch <-
+  get_table("storage_dispatch.csv") |>
+  rename(GENERATION_PROJECT = generation_project) |>
+  mutate(value = DischargeMW - ChargeMW) |>
+  # left_join(all_projects) |>
+  # gen_tech = str_extract(generation_project, "(?<=_).*$")) |>
+  # collect() |>
+  # pivot_longer(cols = c("ChargeMW", "DischargeMW", "StateOfCharge")) |>
+  left_join(all_scenarios) |>
+  left_join(all_project_types) |>
+  left_join(all_timepoints) |>
+  select(-any_of("scen")) |>
+  mutate(value  = round(value, 2)) |>
+  as.data.table()
+
+# Transmission
+transmission_dispatch <- 
+  get_table("DispatchTx.csv") |>
+  rename(from_zone = 1, to_zone = 2, timepoint = 3, value = DispatchTx) |>
+  mutate(value  = round(value, 2)) |>
+  left_join(all_scenarios) |>
+  # left_join(all_project_types) |>
+  left_join(all_timepoints) |>
+  # left_join(all_transmission) |>
+  mutate(gen_tech = "Transmission", tech_type = "Transmission" 
+         # status = "Delivered"
+         ) |>
+  select(-any_of("scen")) |>
+  as.data.table()
+
+transmission_zone_export <- transmission_dispatch |>
+  group_by(across(c(-to_zone, -value))) |>
+  summarise(export = sum(value, na.rm = T), .groups = "drop") |>
+  # mutate(name = "Tx-Export", .before = "export") |>
+  rename(load_zone = from_zone) |>
+  as.data.table()
+  
+transmission_zone_import <- transmission_dispatch |>
+  group_by(across(c(-from_zone, -value))) |>
+  summarise(import = sum(value, na.rm = T), .groups = "drop") |>
+  # mutate(name = "Tx-Import", .before = "import") |>
+  rename(load_zone = to_zone) |>
+  as.data.table()
+
+transmission_diff <- full_join(
+  transmission_zone_export, 
+  transmission_zone_import) |>
+  mutate(value = round(import - export)) # make import positive
+
+dispatch_h <- rbindlist(
+  list(generation_dispatch, storage_dispatch,
+       transmission_diff,
+       unserved_load, curtailed_generation), 
+  use.names = T, fill = T) 
+
+if (F) {
+  # Checks
+  transmission_diff$value |> summary()
+  dispatch_h$tech_type |> unique()
+  dispatch_h$load_zone |> unique()
+  filter(dispatch_h, is.na(tech_type))
+  filter(dispatch_h, is.na(load_zone))
+}
+
+dispatch_h |>
+  # filter(YDAY %in% 120:123) |>
+  filter(YDAY %in% 50:51) |>
+  # filter(!(name %in% c("StateOfCharge", "Battery"))) |>
+  # filter(!(tech_type %in% "Transmission")) |>
+  filter(load_zone %in% unique(dispatch_h$load_zone)[1]) |>
+  group_by(scenario, load_zone, datetime, YDAY, HOUR, tech_type) |>
+  summarise(value = sum(value, na.rm = T), .groups = "drop") |>
+  left_join(
+    select(load_curve, load_zone, datetime, zone_demand_mw, iso3c) |> unique()
+    ) |>
+  # complete(scenario, load_zone, datetime, YDAY, HOUR, tech_type,
+  #          fill = list(value = 0)) |>
+  ggplot() +
+  # geom_area(aes(datetime, value/1e3, fill = tech_type)) +
+  geom_bar(aes(datetime, value/1e3, fill = tech_type), stat = "identity") +
+  scale_fill_viridis_d(option = "H", name = "") +
+  geom_line(aes(datetime, zone_demand_mw / 1e3), color = "red") +
+  facet_grid(scenario~load_zone, scales = "free_y") +
+  labs(y = "GWh", x = "") +
+  theme_mcet()
+
+```
+
+### By season
+```{r, fig.height=8, message=FALSE, warning=FALSE}
+dispatch_season_mean <- dispatch_h |> 
+  add_season() |>
+  group_by(iso3c, mod_shape, mod_ver, scenario, 
+           # load_zone, 
+           season, tech_type, HOUR) |>
+  summarise(value = mean(value, na.rm = T))
+
+dispatch_season_mean |>
+  ggplot() +
+  geom_area(aes(HOUR, value/1e3, fill = tech_type)) +
+   # geom_bar(aes(HOUR, value/1e3, fill = tech_type), stat = "identity") +
+  scale_fill_viridis_d(option = "H", name = "") +
+  # geom_line(aes(datetime, zone_demand_mw / 1e3), color = "red") +
+  facet_grid(scenario~season, scales = "free_y") +
+  labs(y = "GWh", x = "") +
+  theme_mcet()
+  
+
+```
+

@@ -307,6 +307,7 @@ rev_country <- function() {
 rev_read_yaml <- function(iso3c = NULL, path = NULL,
                           filename = paste0("config_", iso3c, ".yml"),
                           projdir = getwd(),
+                          make_dirs = TRUE,
                           raw = FALSE) {
   # browser()
   if (is.null(iso3c)) iso3c <- rev_country()
@@ -324,11 +325,30 @@ rev_read_yaml <- function(iso3c = NULL, path = NULL,
   p$dir <- lapply(p$dir, function(x) {unlist(x) %>% paste(collapse = "/")})
   p$files <- lapply(p$files, function(x) {unlist(x) %>% paste(collapse = "/")})
 
-  rev_make_project_dirs(p)
+  if (make_dirs) rev_make_project_dirs(p)
   p
 }
 
+rev_get_gisfile <- function(
+    iso3c = NULL,
+    yaml_dir = "config",
+    mod_shape = "mod_toy",
+    filename = paste0("config_", iso3c, ".yml")
+    ) {
+  # browser()
+  fl <- fp(yaml_dir, mod_shape, filename)
+  if (!file.exists(fl)) {stop("File not found: ", fl)}
+
+  fl <- rev_read_yaml(filename = fl, make_dirs = F)$files$gis
+  if (!file.exists(fl)) {stop("File not found: ", fl)}
+
+  ob <- load(fl)
+  return(get(ob)$mod_map$sf)
+  # gis
+}
+
 if (F) {
+  rev_get_gisfile("VNM")
   p <- rev_read_yaml(paste0("config_COL.yml"))
   p
 }
@@ -380,6 +400,15 @@ rev_theme_void <- function() {
     ggplot2::theme(
       plot.title = element_text(hjust = 0.5),
       plot.subtitle = element_text(hjust = 0.5))
+}
+
+theme_no_ticks <- function() {
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
 }
 
 #### MCET scenarios ####
@@ -770,7 +799,8 @@ make_mcet_scenarios_queue_2 <- function(
   if (fWrt(f_no_tx)) write_lines(scenarios_tx.txt, f_tx)
 
   # add csv-constraints
-  transmission_lines.csv <- fread(fp(switch_dir, "inputs/transmission_lines.csv"))
+  transmission_lines.csv <-
+    fread(fp(switch_dir, "inputs/transmission_lines.csv"))
   BuildTx.csv <- fread(fp(switch_dir, glue("outputs-{reference_scenario}"),
                           "BuildTx.csv"))
 
@@ -826,3 +856,121 @@ if (F) {
     switch_dir = "scenarios/ISO-test/mod_toy/scen_pypsa_2050_TOL99/switch"
   )
 }
+
+countdown <- function(s) {
+  for (i in rev(seq(s))) {
+    cat("\rStarting in", i, "s. Press <Esc> to cancel")
+    Sys.sleep(1)
+  }
+  cat("\n")
+}
+# countdown(5)
+
+# ============================================================================= #
+# Process results ####
+switch_to_parquet <- function(
+    # scen_path_pattern = "scenarios/(BGD|VNM)/mod_toy/scen_pypsa_2050_TOL99/switch/",
+  scen_path = "scenarios",
+  mod_shape = "mod_toy",
+  mod_ver = "scen_pypsa_2050_TOL99",
+  iso3c = c("BGD", "VNM", "THA", "KAZ", "IND", "CHN", "COL", "CHL"),
+  switch_dir = "switch$",
+  files_ext = c(".csv$", ".txt$", ".json$"),
+  import_folders = c("inputs$", "output(s?)[-_ ]?"),
+  save_format = "parquet",
+  save_path = save_format
+) {
+  d <- list.dirs(path = scen_path)
+  ii <-
+    grepl(mod_shape, d, ignore.case = T) &
+    grepl(mod_ver, d, ignore.case = T) &
+    grepl(paste(iso3c, collapse = "|"), d, ignore.case = T) &
+    grepl(switch_dir, d, ignore.case = T)
+  nmod <- sum(ii)
+  message("Found ", nmod, " models:")
+  cat(d[ii], sep = "\n")
+  message("Saving/appending to ", save_path)
+  countdown(5)
+  # d <- list.files(pattern = scen_pattern, include.dirs = T, recursive = T)
+  # browser()
+  for (i in d[ii]) {
+    cont <- str_extract(i, iso3c)
+    cont <- cont[!is.na(cont)]
+    if (is.na(cont)) stop("Contry code not found in the path", i)
+    if (length(cont) > 1) stop("Two country-codes found ", i, " ",
+                               paste(cont, sep = ", "))
+    # mod_name <- "scen_pypsa_2050_TOL99"
+    sns <- lapply(import_folders, function(x) {
+      list.files(i, pattern = x, full.names = T)
+    }) |> unlist()
+    sns <- c(i, sns) |> unique()
+    # r <- sns[5]
+    for (r in sns) {
+      if (grepl("input", r)) {
+        # browser()
+        # inputs folder
+        scen_name <- str_extract(r, "(?<=input(s|)[-_]).*")
+        # if (is_empty(scen_name) || is.na(scen_name) || scen_name == "") {
+        #   scen_name <- NULL
+        # }
+        dir_name <- "inputs"
+      } else if (grepl("output", r)) {
+        scen_name <- str_extract(r, "(?<=output(s?)[-_ ]).*")
+        dir_name <- "outputs"
+      } else if (grepl(switch_dir, r)) {
+        scen_name <- NULL
+        dir_name <- NULL
+      } else {
+        message("Skipping folder: ", r)
+        next
+      }
+      if (is_empty(scen_name) || is.na(scen_name) || scen_name == "") {
+        scen_name <- NULL
+      }
+      ff <- lapply(files_ext, function(x) {
+        list.files(r, x, full.names = T, ignore.case = T)
+      }) |> unlist()
+      # ff <- list.files(r, ".csv$", full.names = T)
+      message("Country: '", cont, "', Scenario: '", scen_name,
+              "', ", length(ff), " files.")
+      if (!is_empty(ff)) p <- progressr::progressor(along = ff)
+      for (f in ff) {
+        p(basename(f))
+        # browser()
+        if (grepl(".txt$", f)) {
+          # browser()
+          # csv_f <- arrow::read_csv_arrow(f, col_names = F)
+          csv_f <- read_lines(f) |> as.data.table()
+        } else if (grepl(".json$", f)) {
+          # browser()
+          csv_f <- read_lines(f) |> as.data.table()
+          # csv_f <- arrow::read_json_arrow(f, col_names = F)
+        } else if (grepl(".csv$", f)) {
+          csv_f <- fread(f)
+        } else {
+          warning("Unknown file extention ", basename(f))
+          csv_f <- arrow::read_csv_arrow(f)
+        }
+        csv_f <- csv_f |>
+          mutate(
+            # file = gsub(".csv", "", basename(f)),
+            iso3c = cont,
+            mod_shape = mod_shape,
+            mod_ver = mod_ver,
+            scen = scen_name,
+            .before = 1
+          ) |>
+          group_by(iso3c, mod_shape, mod_ver)
+        if (!is.null(scen_name)) csv_f <- csv_f |> group_by(scen, .add = TRUE)
+        csv_f |>
+          write_dataset(
+            # path = save_path,
+            # path = fp(save_path, paste0("file=", basename(f))),
+            path = paste(save_path, dir_name, basename(f), sep = "/"),
+            format = save_format,
+            existing_data_behavior = "delete_matching")
+      }
+    }
+  }
+}
+
