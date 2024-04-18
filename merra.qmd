@@ -1,0 +1,37 @@
+---
+title: "Wind and Solar capacity factors based on MERRA2 data"
+date: "`r format(Sys.time(), tz = 'UTC', format = '%Y-%m-%d %H:%M:%S %Z')`"
+editor: source
+format: pdf
+    toc: yes
+    toc_depth: 5
+    fig_caption: yes
+params: 
+  iso3c: BGD # country code 
+  # yaml_path: "config/mod_adm" #  file: "config_{iso3c}.yml
+  # yaml_path: "config/mod_toy" #
+  yaml_path: "config/mod_custom" #
+  weather_year: 2013 # weather year
+  reimport_all: false # if true, saved merra and pre-processed data won't be used
+  win_hub_height: 100 # meters, hub height, options:  50, 100, 150 (see info) 
+  win_onshore_max_MW_km2: 4 # assumption (see info), maximum MW per km2
+  win_offshore_max_MW_km2: 4 # assumption (see info), maximum MW per km2
+  win_gwa_regroup: false # if true, redo GWA groupping
+  win_gwa_cf_min: 0.2 # lowest capacity factor in Global Wind Atlas, class 2
+  win_merra_cf_min: 0.1 # lowest capacity factor according to MERRA2
+  win_recluster: false # ignore/overwrite previously saved clusters
+  # win_cl_max: null # maximum number of clusters of wind-data per region
+  win_cl_tol: [0.02, .05, 0.1, 0.2, 1.0] 
+  sol_pv_type: tl # tracker options: fh, fl, tl, td (see info)
+  sol_onshore_max_MW_km2: 80 # assumption (see info), maximum MW per km2
+  sol_offshore_max_MW_km2: 0 # assumption (see info), maximum MW per km2
+  sol_recluster: false # ignore/overwrite previously saved clusters
+  # sol_cl_max: null # maximum number clusters of solar-data per region
+  sol_cl_tol: [0.01, 0.02, .05, 0.1, 1.0]  # maximum loss of s.d. 
+  echo: false # show R-script in reports
+  print_parameters: true # print YAML parameters
+  file_prefix: "merra_"
+  file_suffix: "_{param$weather_year}"
+---
+
+(unfinished migration from `merra.rmd`)

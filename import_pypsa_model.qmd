@@ -28,9 +28,10 @@ params:
   # iso3c: COL
   # iso3c: IND 
   # iso3c: KAZ
-  iso3c: MYS
+  # iso3c: MYS
   # iso3c: THA
   # iso3c: VNM
+  iso3c: ZAF
   # Model choice, defined by selection of a the YAML file
   yaml_path: "config/mod_toy" # file: "{yaml_path}/config_{iso3c}.yml
   # yaml_path: "config/mod_adm" # file: "{yaml_path}/config_{iso3c}.yml
@@ -49,7 +50,7 @@ params:
   ## 1. Use tech-data from PyPSA-techs dataset (costs, fuels, lifetime)
   use_tech_database: false # 
   ## 2. Capacity factors from MERRA2 (wind and solar only)
-  use_merra_data: true # Update capacity factors with (pre-saved) MERRA-2
+  use_merra_data: false # Update capacity factors with (pre-saved) MERRA-2
   weather_year: 2013 # weather year
   sol_cl_tol: 1 # SD loss tolerance [0-1] (1 == 100%, one cluster per region)
   win_cl_tol: 1 # SD loss tolerance [0-1] (1 == 100%, one cluster per region)
@@ -961,56 +962,59 @@ onwind <- nc$generators_cf |>
 
 ```{r}
 #| eval: !expr params$use_merra_data
-win_cl_mask <- rev_merra_cl_filemask(p$win_cl_tol)
-p$files$merra_win <- 
-  fp(p$dir$data_mod, glue("merra_win_{win_cl_mask}_{p$weather_year}.fst"))
 
-cf_win <- read_fst(p$files$merra_win, as.data.table = T) |>
-  filter(cluster <= p$win_cl_max) |> as.data.table()
-
-if (is.null(cf_win$offshore)) cf_win[, offshore := grepl("_off$", reg_off)]
-summary(cf_win$offshore) # check if there is offshore data
-# if (!params$add_wind_offshore) 
-cf_wif <- cf_win[offshore == T] # separate offshore data
-cf_win <- cf_win[offshore == F]
-
-onwind_merra <- onwind |> 
-  mutate(offshore = FALSE) |>
-  left_join(cf_win, by = c("region" = "reg_off", "slice", "offshore")) |>
-  # filter(!offshore) |>
-  select(-wind_cf) |>
-  rename(wind_cf = wcf100m) |> #!!! rename wind_cf and cf_win
-  select(-starts_with("wcf"), -year) 
-
-onwind_merra$wind_cf |> summary()
-# onwind_merra$offshore |> summary()
-onwind_merra$region |> unique()
-onwind_merra$generators_t_p_max_pu_i |> unique()
-
-if (p$update_pypsa_model) {
-  # option #1 - replace NA's with zeros 
-  pypsa_update_onwind <- onwind_merra |> 
-    replace_na(list(wind_cf = 0)) |>
-    select(generators_t_p_max_pu_i, snapshots, wind_cf) |>
-    rename(generators_t_p_max_pu = wind_cf)
-
-  if (F) {# option #2 - keep original PyPSA data for missing techs (NA's)
-    onwind_merra |> 
+if (params$use_merra_data) {
+  win_cl_mask <- rev_merra_cl_filemask(p$win_cl_tol)
+  p$files$merra_win <- 
+    fp(p$dir$data_mod, glue("merra_win_{win_cl_mask}_{p$weather_year}.fst"))
+  
+  cf_win <- read_fst(p$files$merra_win, as.data.table = T) |>
+    filter(cluster <= p$win_cl_max) |> as.data.table()
+  
+  if (is.null(cf_win$offshore)) cf_win[, offshore := grepl("_off$", reg_off)]
+  summary(cf_win$offshore) # check if there is offshore data
+  # if (!params$add_wind_offshore) 
+  cf_wif <- cf_win[offshore == T] # separate offshore data
+  cf_win <- cf_win[offshore == F]
+  
+  onwind_merra <- onwind |> 
+    mutate(offshore = FALSE) |>
+    left_join(cf_win, by = c("region" = "reg_off", "slice", "offshore")) |>
+    # filter(!offshore) |>
+    select(-wind_cf) |>
+    rename(wind_cf = wcf100m) |> #!!! rename wind_cf and cf_win
+    select(-starts_with("wcf"), -year) 
+  
+  onwind_merra$wind_cf |> summary()
+  # onwind_merra$offshore |> summary()
+  onwind_merra$region |> unique()
+  onwind_merra$generators_t_p_max_pu_i |> unique()
+  
+  if (p$update_pypsa_model) {
+    # option #1 - replace NA's with zeros 
+    pypsa_update_onwind <- onwind_merra |> 
+      replace_na(list(wind_cf = 0)) |>
       select(generators_t_p_max_pu_i, snapshots, wind_cf) |>
-      rows_patch(
-        select(onwind, generators_t_p_max_pu_i, snapshots, wind_cf), 
-        by = c("generators_t_p_max_pu_i", "snapshots")
-      )
+      rename(generators_t_p_max_pu = wind_cf)
+  
+    if (F) {# option #2 - keep original PyPSA data for missing techs (NA's)
+      onwind_merra |> 
+        select(generators_t_p_max_pu_i, snapshots, wind_cf) |>
+        rows_patch(
+          select(onwind, generators_t_p_max_pu_i, snapshots, wind_cf), 
+          by = c("generators_t_p_max_pu_i", "snapshots")
+        )
+    }
   }
+  
+  # overwrite
+  onwind <- onwind_merra |>
+    filter(!is.na(cluster)) |> # drop regions w/o data (low potential)
+    mutate(
+      tech = make_tech_name(tech, as.integer(cluster)),
+      weather = make_tech_name(weather, as.integer(cluster))
+    )  
 }
-
-# overwrite
-onwind <- onwind_merra |>
-  filter(!is.na(cluster)) |> # drop regions w/o data (low potential)
-  mutate(
-    tech = make_tech_name(tech, as.integer(cluster)),
-    weather = make_tech_name(weather, as.integer(cluster))
-  )  
 
 ```
 

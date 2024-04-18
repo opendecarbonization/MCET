@@ -169,8 +169,10 @@ rev_integer_breaks <- function(n = 5, must_have = NULL, ...) {
 rev_bus2reg <- function(x, num_width = 2, sep = "", mod = "mod_toy") {
   # browser()
   if (grepl("toy", mod)) { # toy model
-    NN <- str_extract(x, "[0-9]+$")
-    TXT <- str_replace(x, NN, "") %>% str_trim() %>% toupper()
+    NN <- str_replace_all(x, " ", "") |> str_extract("[0-9]+$")
+    # str_replace_all(x, "[A-Za-z ]+", "")
+    # TXT <- str_replace(x, NN, "") %>% str_trim() %>% toupper()
+    TXT <- str_extract_all(x, "[A-Za-z]+") |> toupper()
     if (any(grepl("[0-9]", TXT)))
       stop("Unrecognized (non-ending or multiple) numeric indexes in names")
     NN <- formatC(as.integer(NN), width = num_width, flag = "0", format = "d")

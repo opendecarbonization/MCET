@@ -82,7 +82,7 @@ last_config.RData
 *.pdf
 *.html
 figures/*
-*.Rmd
+#*.Rmd
 *.rmarkdown
 
 # oldies
